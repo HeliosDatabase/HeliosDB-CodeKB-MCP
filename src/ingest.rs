@@ -1,0 +1,668 @@
+//! Source-tree ingestion.
+//!
+//! Walks a source root with `.gitignore` awareness, classifies each
+//! file by extension, and routes it to the right engine API:
+//!
+//! | Class                                        | Engine path                                   |
+//! |----------------------------------------------|-----------------------------------------------|
+//! | Code (rs / py / ts / tsx / js / go / sql)    | upsert into `src`, then `db.code_index(...)`  |
+//! | Markdown (`.md`)                             | same — engine has tree-sitter Markdown grammar |
+//! | Text-like (`.txt`, `.rst`, `.tex`, `.org`)   | upsert into `docs`, then `db.graph_rag_ingest_docs(...)` |
+//! | PDF (born-digital)                           | `pdf-extract` → `docs` → graph-rag             |
+//! | DOCX                                         | `docx-rs` → `docs` → graph-rag                  |
+//! | XLSX                                         | `calamine` → `docs` → graph-rag                 |
+//!
+//! Files skipped: anything not in the lists above; binaries; files
+//! that fail to read or fail to be valid UTF-8 for code paths;
+//! anything matched by `.gitignore` or living in a hidden directory
+//! (the `ignore` crate handles those by default).
+//!
+//! Phase-2 scope is the **default tier** — no Docling. Future
+//! `--features docling` work routes scanned PDFs / images / audio
+//! through `db.graph_rag_ingest_pdf` etc.
+
+use std::path::{Path, PathBuf};
+use std::time::Instant;
+
+use anyhow::{Context, Result};
+use heliosdb_nano::code_graph::{CodeIndexOptions, CodeIndexStats};
+use heliosdb_nano::config::{Config as EngineConfig, WalSyncModeConfig};
+use heliosdb_nano::graph_rag::{ChunkStrategy, IngestDocsOptions, IngestStats as DocStats};
+use heliosdb_nano::{EmbeddedDatabase, Value};
+use ignore::WalkBuilder;
+
+/// Open an `EmbeddedDatabase` configured for the bulk-ingest workload.
+///
+/// Defaults to **Async WAL fsync** (`WalSyncModeConfig::Async`) — for
+/// a code-graph index that's regenerable from source, durability is
+/// not a property we need to pay for. The engine documents Async as
+/// "10–100× throughput" vs the default Sync mode (`src/storage/wal.rs`
+/// header comment). Pass `durable = true` to opt back into Sync.
+pub fn open_kb_for_ingest(kb_dir: &Path, durable: bool) -> Result<EmbeddedDatabase> {
+    let mut cfg = EngineConfig::default();
+    cfg.storage.path = Some(kb_dir.to_path_buf());
+    cfg.storage.memory_only = false;
+    cfg.storage.wal_sync_mode = if durable {
+        WalSyncModeConfig::Sync
+    } else {
+        WalSyncModeConfig::Async
+    };
+    EmbeddedDatabase::with_config(cfg)
+        .with_context(|| format!("failed to open EmbeddedDatabase at {}", kb_dir.display()))
+}
+
+const MAX_FILE_BYTES: u64 = 5 * 1024 * 1024; // 5 MiB; bigger files skipped
+const SOURCE_TABLE: &str = "src";
+const DOCS_TABLE: &str = "docs";
+const MAX_ERROR_SAMPLES: usize = 10;
+/// Emit a progress line to stderr roughly every this often during the
+/// walk-and-upsert phase. Long ingests (10 k+ file repos at minutes
+/// of cold-build wall) need progress feedback so the user doesn't
+/// think the binary hung.
+const PROGRESS_INTERVAL: std::time::Duration = std::time::Duration::from_secs(2);
+/// Also emit a progress line every N files seen (fast walks where
+/// the time-based interval doesn't fire). Catches the case where a
+/// 10 k file walk finishes in 5 s — still gets two progress lines.
+const PROGRESS_EVERY_FILES: u64 = 250;
+
+/// Directory names that are unconditionally pruned during the walk —
+/// ripgrep parity even when the source tree has no `.git` (and
+/// therefore no honoured `.gitignore`). Build outputs, vendor dirs,
+/// virtualenvs, IDE caches.  Gate-keeps "files seen: 3268" for trees
+/// where the actual code tree is ~10 files.
+const SKIP_DIRS: &[&str] = &[
+    "target",        // Rust / Cargo
+    "node_modules",  // JS / TS
+    "dist",          // generic + Python sdist
+    "build",         // CMake / generic
+    "out",           // generic
+    ".venv", "venv", // Python virtualenvs
+    "__pycache__",   // Python bytecode
+    ".next", ".nuxt",// Next / Nuxt
+    ".cache",        // tooling caches
+    "vendor",        // Go / Ruby
+    "Pods",          // CocoaPods (iOS)
+    ".gradle", ".mvn", // JVM
+    ".idea", ".vscode", // IDE state (not code)
+    ".pytest_cache", ".mypy_cache", ".ruff_cache", ".tox",
+];
+
+#[derive(Debug, Clone)]
+pub struct IngestOptions {
+    pub source_root: PathBuf,
+    /// When false, PDFs / DOCX / XLSX are skipped (default tier
+    /// minus the binary doc decoders, useful if those crates fail
+    /// to compile on a particular platform). Effectively forced
+    /// false when this crate is built without
+    /// `--features native-binary-docs`.
+    pub include_binary_docs: bool,
+    /// Pass-through to engine `CodeIndexOptions::force_reparse` —
+    /// ignore the content-hash gate and re-parse every file.
+    pub force_reparse: bool,
+    /// When true, opens the KB with `WalSyncModeConfig::Sync` (fsync
+    /// every write — slow but durable). Default `false` uses
+    /// `WalSyncModeConfig::Async` for 10–100× throughput, accepting
+    /// that a crash mid-ingest may corrupt the regenerable index.
+    pub durable_writes: bool,
+}
+
+#[derive(Debug, Default)]
+pub struct IngestSummary {
+    pub files_seen: u64,
+    pub code_upserts: u64,
+    pub doc_upserts: u64,
+    pub binary_upserts: u64,
+    pub skipped: u64,
+    pub read_errors: u64,
+    /// First MAX_ERROR_SAMPLES failure paths + reasons.  Empty when
+    /// no errors happened.
+    pub read_error_samples: Vec<String>,
+    pub elapsed_ms: u128,
+    pub code: Option<CodeIndexStats>,
+    pub docs: Option<DocStats>,
+}
+
+#[derive(Debug)]
+enum Class<'a> {
+    Code(&'a str), // engine `lang` tag — must match `Language::from_name`
+    Text,
+    Notebook, // .ipynb — extract code cells, classify by metadata.kernelspec
+    Pdf,
+    Docx,
+    Xlsx,
+    Skip,
+}
+
+fn classify(path: &Path) -> Class<'static> {
+    let ext = path
+        .extension()
+        .and_then(|s| s.to_str())
+        .map(|s| s.to_ascii_lowercase());
+    let ext = match ext.as_deref() {
+        Some(e) => e,
+        None => return Class::Skip,
+    };
+    match ext {
+        "rs" => Class::Code("rust"),
+        "py" => Class::Code("python"),
+        "ts" => Class::Code("typescript"),
+        "tsx" => Class::Code("tsx"),
+        "js" | "mjs" | "cjs" => Class::Code("javascript"),
+        "go" => Class::Code("go"),
+        "sql" => Class::Code("sql"),
+        "md" | "markdown" => Class::Code("markdown"),
+        // Notebook — special-cased extractor (see `extract_ipynb`).
+        "ipynb" => Class::Notebook,
+        // Schema/IDL files: registered grammars cover graphql; the rest
+        // fall back to text retrieval.
+        "graphql" | "gql" => Class::Text,    // schema text — searchable
+        "proto" | "thrift" => Class::Text,   // IDL — searchable
+        // Text class — flat retrieval via graph_rag_ingest_docs.
+        "txt" | "rst" | "tex" | "org" | "log"
+        | "toml" | "yaml" | "yml" | "json" | "ini" | "cfg" => Class::Text,
+        "pdf" => Class::Pdf,
+        "docx" => Class::Docx,
+        "xlsx" | "xlsm" => Class::Xlsx,
+        _ => Class::Skip,
+    }
+}
+
+pub fn ingest(db: &EmbeddedDatabase, opts: IngestOptions) -> Result<IngestSummary> {
+    let started = Instant::now();
+    let mut summary = IngestSummary::default();
+
+    ensure_tables(db)?;
+
+    // Bulk-upsert path: one transaction around the whole walk so the
+    // engine pays durability overhead once instead of per-row. RAII
+    // guard rolls back on any error during the loop.
+    let txn = TxnGuard::begin(db)?;
+    let walk_result = walk_and_upsert(db, &opts, &mut summary);
+    match walk_result {
+        Ok(()) => txn.commit()?,
+        Err(e) => {
+            // ROLLBACK is best-effort — we surface the original walk error.
+            let _ = txn.rollback();
+            return Err(e);
+        }
+    }
+
+
+    // Step 2: run the code-graph indexer over the `src` table.
+    if summary.code_upserts > 0 {
+        eprintln!(
+            "ingest phase: walk done in {:.1} s ({} files upserted) — \
+             starting code-graph indexer (parse + symbol extract + write to _hdb_code_*)",
+            started.elapsed().as_secs_f64(),
+            summary.code_upserts
+        );
+        let code_started = Instant::now();
+        let cio = CodeIndexOptions {
+            source_table: SOURCE_TABLE.to_string(),
+            embed_bodies: false, // first cut — embeddings are a separate phase
+            embed_endpoint: None,
+            embed_bearer: None,
+            force_reparse: opts.force_reparse,
+            // Engine v3.21.0+ — auto parallelism (min(num_cpus, 8)),
+            // single chunk (max parse throughput for the pilot scale).
+            parallelism: None,
+            chunk_size: None,
+        };
+        match db.code_index(cio) {
+            Ok(s) => {
+                summary.code = Some(s);
+                eprintln!(
+                    "ingest phase: code-graph done in {:.1} s",
+                    code_started.elapsed().as_secs_f64()
+                );
+            }
+            Err(e) => tracing::warn!("code_index failed: {e}"),
+        }
+    }
+
+    // Step 3: run the graph-rag doc ingester over the `docs` table.
+    if summary.doc_upserts + summary.binary_upserts > 0 {
+        eprintln!(
+            "ingest phase: starting graph-rag doc projection ({} rows)",
+            summary.doc_upserts + summary.binary_upserts
+        );
+        let docs_started = Instant::now();
+        let opts2 = IngestDocsOptions {
+            source_table: DOCS_TABLE.to_string(),
+            id_col: "path".to_string(),
+            text_col: "content".to_string(),
+            title_col: None,
+            chunk_by: ChunkStrategy::Row,
+        };
+        match db.graph_rag_ingest_docs(&opts2) {
+            Ok(s) => {
+                summary.docs = Some(s);
+                eprintln!(
+                    "ingest phase: graph-rag done in {:.1} s",
+                    docs_started.elapsed().as_secs_f64()
+                );
+            }
+            Err(e) => tracing::warn!("graph_rag_ingest_docs failed: {e}"),
+        }
+    }
+
+    summary.elapsed_ms = started.elapsed().as_millis();
+    Ok(summary)
+}
+
+/// Walk the source tree, classify each file, upsert into `src` /
+/// `docs`. The caller wraps this in a transaction (see `ingest`).
+fn walk_and_upsert(
+    db: &EmbeddedDatabase,
+    opts: &IngestOptions,
+    summary: &mut IngestSummary,
+) -> Result<()> {
+    let walker = WalkBuilder::new(&opts.source_root)
+        .hidden(true)        // skip dot-files / dot-dirs (incl. .git, .helios-kb)
+        .git_ignore(true)    // honour .gitignore
+        .git_global(true)    // honour ~/.config/git/ignore
+        .git_exclude(true)
+        .filter_entry(|entry| {
+            // ripgrep parity: skip well-known build / vendor dirs even
+            // when there's no .git (so .gitignore wouldn't catch them).
+            if entry.file_type().map(|t| t.is_dir()).unwrap_or(false) {
+                if let Some(name) = entry.file_name().to_str() {
+                    if SKIP_DIRS.contains(&name) {
+                        return false;
+                    }
+                }
+            }
+            true
+        })
+        .build();
+
+    let mut last_progress_at = Instant::now();
+    let mut last_progress_files: u64 = 0;
+    let walk_started = Instant::now();
+    for entry in walker {
+        let entry = match entry {
+            Ok(e) => e,
+            Err(_) => {
+                summary.read_errors += 1;
+                continue;
+            }
+        };
+
+        // Periodic progress to stderr — fires whichever of {time-since-last,
+        // files-since-last} threshold is hit first. Both quiet for tiny runs.
+        if last_progress_at.elapsed() >= PROGRESS_INTERVAL
+            || summary.files_seen.saturating_sub(last_progress_files) >= PROGRESS_EVERY_FILES
+        {
+            eprintln!(
+                "ingest progress: walked {} files ({} code, {} text, {} doc upserted) — {:.1} s",
+                summary.files_seen,
+                summary.code_upserts,
+                summary.doc_upserts,
+                summary.binary_upserts,
+                walk_started.elapsed().as_secs_f64()
+            );
+            last_progress_at = Instant::now();
+            last_progress_files = summary.files_seen;
+        }
+
+        let path = entry.path();
+        if !entry.file_type().map(|t| t.is_file()).unwrap_or(false) {
+            continue;
+        }
+        // Skip anything inside the KB itself (defence in depth — gitignore
+        // should have caught it, but the user might run ingest before
+        // saving .gitignore).
+        if path.components().any(|c| c.as_os_str() == ".helios-kb"
+                                    || c.as_os_str() == ".helios-index") {
+            continue;
+        }
+
+        summary.files_seen += 1;
+
+        let meta = match entry.metadata() {
+            Ok(m) => m,
+            Err(_) => {
+                summary.skipped += 1;
+                continue;
+            }
+        };
+        if meta.len() > MAX_FILE_BYTES {
+            summary.skipped += 1;
+            continue;
+        }
+
+        let class = classify(path);
+
+        // Generated-file skip: peek the first 4 KiB for the
+        // canonical "@generated" marker (Facebook / Google / Bazel
+        // convention). Only applied to Code / Notebook classes —
+        // text and binary doc extraction shouldn't be skipped.
+        if matches!(class, Class::Code(_) | Class::Notebook) && is_generated_file(path) {
+            summary.skipped += 1;
+            continue;
+        }
+
+        let rel = relative_path(path, &opts.source_root);
+
+        match class {
+            Class::Code(lang) => match read_utf8(path) {
+                Ok(content) => {
+                    upsert_src(db, &rel, &content, lang)?;
+                    summary.code_upserts += 1;
+                }
+                Err(e) => record_read_error(summary, path, &e.to_string()),
+            },
+            Class::Text => match read_utf8(path) {
+                Ok(content) => {
+                    upsert_doc(db, &rel, &content, "text")?;
+                    summary.doc_upserts += 1;
+                }
+                Err(e) => record_read_error(summary, path, &e.to_string()),
+            },
+            Class::Notebook => match extract_ipynb(path) {
+                Ok((src_text, lang)) if !src_text.trim().is_empty() => {
+                    upsert_src(db, &rel, &src_text, lang)?;
+                    summary.code_upserts += 1;
+                }
+                Ok(_) => record_read_error(summary, path, "notebook had no code cells"),
+                Err(e) => record_read_error(summary, path, &e.to_string()),
+            },
+            Class::Pdf if opts.include_binary_docs => match extract_pdf(path) {
+                Ok(text) if !text.trim().is_empty() => {
+                    upsert_doc(db, &rel, &text, "pdf")?;
+                    summary.binary_upserts += 1;
+                }
+                Ok(_) => record_read_error(summary, path, "PDF produced empty text"),
+                Err(e) => record_read_error(summary, path, &e.to_string()),
+            },
+            Class::Docx if opts.include_binary_docs => match extract_docx(path) {
+                Ok(text) if !text.trim().is_empty() => {
+                    upsert_doc(db, &rel, &text, "docx")?;
+                    summary.binary_upserts += 1;
+                }
+                Ok(_) => record_read_error(summary, path, "DOCX produced empty text"),
+                Err(e) => record_read_error(summary, path, &e.to_string()),
+            },
+            Class::Xlsx if opts.include_binary_docs => match extract_xlsx(path) {
+                Ok(text) if !text.trim().is_empty() => {
+                    upsert_doc(db, &rel, &text, "xlsx")?;
+                    summary.binary_upserts += 1;
+                }
+                Ok(_) => record_read_error(summary, path, "XLSX produced empty text"),
+                Err(e) => record_read_error(summary, path, &e.to_string()),
+            },
+            Class::Pdf | Class::Docx | Class::Xlsx => {
+                // include_binary_docs disabled — silent skip
+                summary.skipped += 1;
+            }
+            Class::Skip => {
+                summary.skipped += 1;
+            }
+        }
+    }
+    Ok(())
+}
+
+/// Tiny RAII guard around BEGIN / COMMIT / ROLLBACK so the upsert
+/// loop runs inside a single transaction (Phase 2.5f).
+struct TxnGuard<'a> {
+    db: &'a EmbeddedDatabase,
+    finished: bool,
+}
+
+impl<'a> TxnGuard<'a> {
+    fn begin(db: &'a EmbeddedDatabase) -> Result<Self> {
+        db.execute("BEGIN").context("BEGIN transaction")?;
+        Ok(Self { db, finished: false })
+    }
+    fn commit(mut self) -> Result<()> {
+        self.db.execute("COMMIT").context("COMMIT transaction")?;
+        self.finished = true;
+        Ok(())
+    }
+    fn rollback(mut self) -> Result<()> {
+        self.db.execute("ROLLBACK").context("ROLLBACK transaction")?;
+        self.finished = true;
+        Ok(())
+    }
+}
+
+impl<'a> Drop for TxnGuard<'a> {
+    fn drop(&mut self) {
+        if !self.finished {
+            // Best-effort rollback if neither commit nor rollback was
+            // called explicitly (e.g. panic).
+            let _ = self.db.execute("ROLLBACK");
+        }
+    }
+}
+
+fn ensure_tables(db: &EmbeddedDatabase) -> Result<()> {
+    db.execute(
+        "CREATE TABLE IF NOT EXISTS src (
+            path     TEXT PRIMARY KEY,
+            content  TEXT,
+            lang     TEXT
+        )",
+    )
+    .context("create src table")?;
+    db.execute(
+        "CREATE TABLE IF NOT EXISTS docs (
+            path     TEXT PRIMARY KEY,
+            content  TEXT,
+            kind     TEXT
+        )",
+    )
+    .context("create docs table")?;
+    Ok(())
+}
+
+/// Peek the first 4 KiB of the file and return true iff it contains
+/// one of the canonical machine-generated markers.  Cheap defence
+/// against indexing protobuf-generated `*.pb.rs`, OpenAPI clients,
+/// vendored bundles etc. that aren't caught by `.gitignore`.
+fn is_generated_file(path: &Path) -> bool {
+    use std::io::Read;
+    let mut file = match std::fs::File::open(path) {
+        Ok(f) => f,
+        Err(_) => return false,
+    };
+    let mut buf = [0u8; 4096];
+    let n = match file.read(&mut buf) {
+        Ok(n) => n,
+        Err(_) => return false,
+    };
+    let head = String::from_utf8_lossy(&buf[..n]);
+    // Match the case-sensitive markers Linguist + Bazel + many tools use.
+    head.contains("@generated")
+        || head.contains("DO NOT EDIT")
+        || head.contains("AUTO-GENERATED")
+        || head.contains("Code generated by")  // Go convention
+}
+
+fn record_read_error(summary: &mut IngestSummary, path: &Path, reason: &str) {
+    summary.read_errors += 1;
+    if summary.read_error_samples.len() < MAX_ERROR_SAMPLES {
+        summary
+            .read_error_samples
+            .push(format!("{}: {}", path.display(), reason));
+    }
+}
+
+fn upsert_src(db: &EmbeddedDatabase, path: &str, content: &str, lang: &str) -> Result<()> {
+    db.execute_params(
+        "INSERT INTO src (path, content, lang) VALUES ($1, $2, $3) \
+         ON CONFLICT(path) DO UPDATE SET content = excluded.content, lang = excluded.lang",
+        &[
+            Value::String(path.to_string()),
+            Value::String(content.to_string()),
+            Value::String(lang.to_string()),
+        ],
+    )
+    .with_context(|| format!("upsert_src {path}"))?;
+    Ok(())
+}
+
+fn upsert_doc(db: &EmbeddedDatabase, path: &str, content: &str, kind: &str) -> Result<()> {
+    db.execute_params(
+        "INSERT INTO docs (path, content, kind) VALUES ($1, $2, $3) \
+         ON CONFLICT(path) DO UPDATE SET content = excluded.content, kind = excluded.kind",
+        &[
+            Value::String(path.to_string()),
+            Value::String(content.to_string()),
+            Value::String(kind.to_string()),
+        ],
+    )
+    .with_context(|| format!("upsert_doc {path}"))?;
+    Ok(())
+}
+
+fn read_utf8(path: &Path) -> Result<String> {
+    let bytes = std::fs::read(path)?;
+    String::from_utf8(bytes).map_err(|e| anyhow::anyhow!("not utf-8: {e}"))
+}
+
+fn relative_path(path: &Path, root: &Path) -> String {
+    path.strip_prefix(root)
+        .unwrap_or(path)
+        .to_string_lossy()
+        .into_owned()
+}
+
+/// Extract concatenated code from a Jupyter `.ipynb` notebook + the
+/// language tag from its `metadata.kernelspec.language`. Falls back
+/// to `python` if the kernel-spec is missing (the dominant case).
+fn extract_ipynb(path: &Path) -> Result<(String, &'static str)> {
+    let body = std::fs::read_to_string(path)
+        .with_context(|| format!("read notebook {}", path.display()))?;
+    // Lightweight: parse as serde_json::Value, walk cells.
+    let v: serde_json::Value = serde_json::from_str(&body)
+        .with_context(|| format!("parse notebook {} as JSON", path.display()))?;
+    let lang_tag = v
+        .pointer("/metadata/kernelspec/language")
+        .and_then(|x| x.as_str())
+        .and_then(|s| match s.to_lowercase().as_str() {
+            "python" | "python3" => Some("python"),
+            "typescript" => Some("typescript"),
+            "javascript" => Some("javascript"),
+            "rust" => Some("rust"),
+            "go" => Some("go"),
+            "sql" => Some("sql"),
+            _ => None,
+        })
+        .unwrap_or("python");
+
+    let mut out = String::new();
+    if let Some(cells) = v.get("cells").and_then(|c| c.as_array()) {
+        for cell in cells {
+            let kind = cell.get("cell_type").and_then(|c| c.as_str()).unwrap_or("");
+            if kind != "code" {
+                continue;
+            }
+            if let Some(src) = cell.get("source") {
+                // `source` is either a single string or an array of strings.
+                if let Some(s) = src.as_str() {
+                    out.push_str(s);
+                    out.push('\n');
+                } else if let Some(arr) = src.as_array() {
+                    for line in arr {
+                        if let Some(s) = line.as_str() {
+                            out.push_str(s);
+                        }
+                    }
+                    out.push('\n');
+                }
+            }
+        }
+    }
+    Ok((out, lang_tag))
+}
+
+#[cfg(feature = "native-binary-docs")]
+fn extract_pdf(path: &Path) -> Result<String> {
+    pdf_extract::extract_text(path).map_err(|e| anyhow::anyhow!("pdf-extract: {e}"))
+}
+
+#[cfg(not(feature = "native-binary-docs"))]
+fn extract_pdf(_path: &Path) -> Result<String> {
+    anyhow::bail!(
+        "PDF ingestion not enabled — rebuild with `--features native-binary-docs` (or use Docling)"
+    )
+}
+
+#[cfg(feature = "native-binary-docs")]
+fn extract_docx(path: &Path) -> Result<String> {
+    use docx_rs::*;
+    let bytes = std::fs::read(path)?;
+    let docx = read_docx(&bytes).map_err(|e| anyhow::anyhow!("docx-rs read: {e}"))?;
+    let mut out = String::new();
+    for child in &docx.document.children {
+        if let DocumentChild::Paragraph(p) = child {
+            for run in &p.children {
+                if let ParagraphChild::Run(r) = run {
+                    for c in &r.children {
+                        if let RunChild::Text(t) = c {
+                            out.push_str(&t.text);
+                        }
+                    }
+                }
+            }
+            out.push('\n');
+        }
+    }
+    Ok(out)
+}
+
+#[cfg(not(feature = "native-binary-docs"))]
+fn extract_docx(_path: &Path) -> Result<String> {
+    anyhow::bail!(
+        "DOCX ingestion not enabled — rebuild with `--features native-binary-docs` (or use Docling)"
+    )
+}
+
+#[cfg(feature = "native-binary-docs")]
+fn extract_xlsx(path: &Path) -> Result<String> {
+    use calamine::{open_workbook_auto, Reader};
+    let mut wb = open_workbook_auto(path).map_err(|e| anyhow::anyhow!("calamine open: {e}"))?;
+    let mut out = String::new();
+    let names: Vec<String> = wb.sheet_names().to_owned();
+    for name in &names {
+        if let Ok(range) = wb.worksheet_range(name) {
+            out.push_str(&format!("# Sheet: {name}\n"));
+            for row in range.rows() {
+                let cells: Vec<String> = row.iter().map(|c| c.to_string()).collect();
+                out.push_str(&cells.join("\t"));
+                out.push('\n');
+            }
+            out.push('\n');
+        }
+    }
+    Ok(out)
+}
+
+#[cfg(not(feature = "native-binary-docs"))]
+fn extract_xlsx(_path: &Path) -> Result<String> {
+    anyhow::bail!(
+        "XLSX ingestion not enabled — rebuild with `--features native-binary-docs` (or use Docling)"
+    )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::path::Path;
+
+    #[test]
+    fn classify_extensions() {
+        assert!(matches!(classify(Path::new("a.rs")), Class::Code("rust")));
+        assert!(matches!(classify(Path::new("a.py")), Class::Code("python")));
+        assert!(matches!(classify(Path::new("a.tsx")), Class::Code("tsx")));
+        assert!(matches!(classify(Path::new("a.md")), Class::Code("markdown")));
+        assert!(matches!(classify(Path::new("a.txt")), Class::Text));
+        assert!(matches!(classify(Path::new("a.pdf")), Class::Pdf));
+        assert!(matches!(classify(Path::new("a.docx")), Class::Docx));
+        assert!(matches!(classify(Path::new("a.xlsx")), Class::Xlsx));
+        assert!(matches!(classify(Path::new("a.png")), Class::Skip));
+        assert!(matches!(classify(Path::new("a")), Class::Skip));
+    }
+}
