@@ -39,7 +39,11 @@ heliosdb-nano = { path = "../Nano", features = [
 ] }
 
 clap = { version = "4", features = ["derive"] }
-tokio = { version = "1", features = ["macros", "rt-multi-thread", "io-std", "sync"] }
+tokio = { version = "1", features = ["macros", "rt-multi-thread", "io-std", "sync", "net", "signal"] }
+# HTTP transport for the MCP server (Cursor / Continue / non-stdio
+# clients).  Version locked to the engine's axum so the `Router`
+# returned by `mcp_router` can be bound directly.
+axum = "0.7"
 serde = { version = "1", features = ["derive"] }
 toml = "0.8"
 anyhow = "1"
