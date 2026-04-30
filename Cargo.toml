@@ -31,7 +31,7 @@ native-binary-docs = ["dep:pdf-extract", "dep:docx-rs", "dep:calamine"]
 docling = []
 
 [dependencies]
-heliosdb-nano = { path = "../Nano", features = [
+heliosdb-nano = { version = "3.22.2", features = [
     "code-graph",
     "graph-rag",
     "mcp-endpoint",
