@@ -1,0 +1,68 @@
+[package]
+name = "heliosdb-codekb-mcp"
+version = "0.1.0"
+edition = "2021"
+description = "MCP stdio server for code+docs knowledge bases, embedding HeliosDB-Nano as a library."
+license = "Apache-2.0"
+repository = "https://github.com/dimensigon/heliosdb-codekb-mcp"
+
+# Standalone — explicit empty workspace so Cargo doesn't try to attach
+# this crate to any parent workspace (helps when sitting next to a
+# git checkout that has its own workspace).
+[workspace]
+
+[[bin]]
+name = "heliosdb-codekb-mcp"
+path = "src/main.rs"
+
+[features]
+default = ["native-binary-docs"]
+
+# Pure-Rust binary-doc decoders (pdf-extract / docx-rs / calamine).
+# On by default; opt out with `--no-default-features` for a leaner
+# binary on hosts that only ingest code + markdown + plain text.
+native-binary-docs = ["dep:pdf-extract", "dep:docx-rs", "dep:calamine"]
+
+# Routes PDF / Office / audio / image ingestion through the engine's
+# graph_rag::ingest_pdf / _office / _audio / _image, which POST to
+# a docling-serve HTTP endpoint. Adds layout-aware tables, OCR, and
+# audio transcription. Compatible with `native-binary-docs` (Docling
+# wins for the formats it supports; native handles fallbacks).
+docling = []
+
+[dependencies]
+heliosdb-nano = { path = "../Nano", features = [
+    "code-graph",
+    "graph-rag",
+    "mcp-endpoint",
+    "code-embed",
+] }
+
+clap = { version = "4", features = ["derive"] }
+tokio = { version = "1", features = ["macros", "rt-multi-thread", "io-std", "sync"] }
+serde = { version = "1", features = ["derive"] }
+toml = "0.8"
+anyhow = "1"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+directories = "5"
+serde_json = "1"
+
+# Source-tree walker that respects .gitignore + skips hidden dirs.
+# Same crate ripgrep uses.
+ignore = "0.4"
+
+# Native ingestion tier (no Docling). Pure Rust, no system deps.
+# Each is `optional` so building with --no-default-features omits
+# them entirely.
+pdf-extract = { version = "0.7", optional = true }
+docx-rs     = { version = "0.4", optional = true }
+calamine    = { version = "0.24", optional = true }
+
+[dev-dependencies]
+tempfile = "3"
+
+[profile.release]
+opt-level = 3
+lto = true
+codegen-units = 1
