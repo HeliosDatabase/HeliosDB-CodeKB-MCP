@@ -31,7 +31,7 @@ item in one place.  Tier 0 = "next on the bench"; Tier 5 =
 | # | Item | Status |
 |---|---|---|
 | 7 | `FEATURE_REQUEST_cross_process_on_conflict.md` | **fixed on engine branch `feat/cross-process-conflict-and-cache-stats` (`6ec74d3`)**. Two divergences fixed: `insert_tuple_versioned_with_schema` now calls `check_unique_constraints` (matching the SQL fast-path sibling); `execute_plan_with_params_inner`'s INSERT arm now honours `on_conflict` (DoNothing / DoUpdate). Plugin's "skip walk in child" workaround can be removed once the engine pin advances. |
-| 8 | `BUGS_MCP_SERVER_CLI_DOCS.md` (option a — docstring fix) | filed 2026-04-26.  Quick doc PR. |
+| 8 | `BUGS_MCP_SERVER_CLI_DOCS.md` (option a — docstring fix) | **closed by engine commit `60f0460`**. `docs/code_graph/{pilot,troubleshooting}.md` + module comments now redirect users from the (non-existent) `heliosdb-nano mcp-server` CLI subcommand to `heliosdb-codekb-mcp serve --source X` (with the new `--http <addr>` flag for non-stdio clients). |
 | 9 | True multi-threaded multi-writer for `_hdb_code_*` (full `parallel_writes` scope) | gated on `Sync`-ing the catalog / ART / transaction state.  Substantial engine refactor.  **Pilot's 5-min target already met without it** — revisit only if a > 10 k file repo workload lands. |
 | 10 | `streaming_pipeline` parse-write overlap | marginal at 12 % post-batched-drain (commit `7bb58c2`). Revisit at 10 k+ file scale. |
 | 11 | `adaptive_topk` for `helios_graphrag_search` | blocked on Phase 3.1 vector + BM25 hybrid scoring. Today's `search.rs` ranks by hop_distance only. |
