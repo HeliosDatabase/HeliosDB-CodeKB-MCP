@@ -2122,11 +2122,12 @@ dependencies = [
  "toml",
  "tracing",
  "tracing-subscriber",
+ "ureq",
 ]
 
 [[package]]
 name = "heliosdb-nano"
-version = "3.22.1"
+version = "3.22.2"
 dependencies = [
  "aes-gcm",
  "argon2",

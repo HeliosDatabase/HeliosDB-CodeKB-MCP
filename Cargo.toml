@@ -74,6 +74,12 @@ pdf-extract = { version = "0.7", optional = true }
 docx-rs     = { version = "0.4", optional = true }
 calamine    = { version = "0.24", optional = true }
 
+# Tiny synchronous HTTP client for `status --mcp-url` (live cache
+# stats from a running `serve --http ...`) and the http_transport
+# contract test.  Already in our tree via fastembed; pinned without
+# default features (no TLS — loopback only).
+ureq = { version = "2", default-features = false, features = ["json"] }
+
 [dev-dependencies]
 tempfile = "3"
 
