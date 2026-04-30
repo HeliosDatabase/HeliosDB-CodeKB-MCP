@@ -67,26 +67,93 @@ compose stack).
 ```bash
 # 0. Build
 cargo build --release
+BIN=$(realpath target/release/heliosdb-codekb-mcp)
 
-# 1. Configure a KB for a source path
-target/release/heliosdb-codekb-mcp init --source /home/me/my-repo --mode co-located
-target/release/heliosdb-codekb-mcp init --source /home/me/Helios  --mode hybrid --kb /home/me/Helios/.helios-kb
+# 1. Configure a KB for a source path AND do the first ingest in one shot
+$BIN init \
+    --source /home/me/my-repo --mode co-located \
+    --ingest
 
-# 2. Wire the MCP server into your agent.  For Claude Code:
-#    .mcp.json
+# 2. Wire the MCP server into your agent.  For Claude Code (.mcp.json):
 {
   "mcpServers": {
     "helios": {
       "command": "/abs/path/to/heliosdb-codekb-mcp",
-      "args": ["serve", "--source", "${workspaceFolder}"]
+      "args": ["serve", "--source", "/home/me/my-repo"]
     }
   }
 }
 
+# Or HTTP transport (Cursor / Continue / any non-stdio client):
+$BIN serve --source /home/me/my-repo --http 127.0.0.1:8765
+
 # 3. Inspect / sanity-check
-target/release/heliosdb-codekb-mcp status
-target/release/heliosdb-codekb-mcp status --source /home/me/my-repo
-target/release/heliosdb-codekb-mcp config show
+$BIN status                                           # global summary
+$BIN status --source /home/me/my-repo                 # per-KB
+$BIN status --source /home/me/my-repo \
+    --mcp-url http://127.0.0.1:8765                   # + live cache stats
+$BIN config show                                      # raw TOML
+```
+
+## Ingest tiers
+
+Three knobs, picked at `init --ingest` or `ingest` time, scaling
+quality vs. wall time on the pilot corpus
+(`~/Helios/Nano`, 666 files / 18 k symbols / 115 k refs):
+
+| Tier                       | Flag                    | Pilot wall   | What lights up                                  |
+|----------------------------|-------------------------|--------------|-------------------------------------------------|
+| **fast** (default)         | *(none)*                | **26 s**     | BM25 + hop-distance ranking on `helios_graphrag_search` |
+| **quality** (blocking)     | `--with-embeddings`     | 3 m 15 s     | Adds in-process FastEmbedder body vectors → paraphrase queries |
+| **background-quality**     | `--background-quality`  | **26 s parent** + ~2 m 50 s detached child | User-wait stays at 26 s; paraphrase quality lifts when the child finishes |
+
+Recommended for repos `>~1 000 files`: `--background-quality`.
+Track via `status --source X` ("quality phase : running pid X" →
+"complete — took Y").
+
+## Resume on interrupt
+
+`ingest` writes `<kb_dir>/.ingest-state.json` at each phase
+transition (`walk → code_index → graph_rag`).  If a process is
+killed mid-flight (Ctrl-C, OOM, reboot), the next `ingest` reads
+the file at startup and skips already-completed phases — the
+walk is skipped if `phase >= code_index`.  Per-file resume *inside*
+`code_index` is the engine's content-hash gate.  Cleared on
+successful completion; surfaced by `status --source X` as
+`ingest resume : interrupted at phase = ...` until then.
+
+## Generated-file skip
+
+Two layers, both honoured during the walk:
+
+- **`@generated` content-marker scan** of the first 4 KiB
+  (Facebook / Google / Bazel / Go convention).
+- **`<root>/.gitattributes` linguist-generated globs** —
+  patterns flagged with `linguist-generated`,
+  `linguist-generated=true`, or `linguist-generated=set` are
+  matched against relative paths and skipped.  Long-tail
+  coverage of generated files (`*.pb.rs`, `codegen/**`,
+  vendored bundles) that don't carry an in-file marker.
+
+## CLI surface
+
+```text
+heliosdb-codekb-mcp <SUBCOMMAND>
+
+  init     [--source PATH] [--mode co-located|global|hybrid] [--kb PATH]
+           [--ingest] [--include-binary-docs BOOL]
+           [--force] [--durable-writes]
+           [--with-embeddings] [--background-quality]
+
+  ingest   [--source PATH] [--include-binary-docs BOOL]
+           [--force] [--durable-writes]
+           [--with-embeddings] [--background-quality]
+
+  serve    [--source PATH] [--http <ADDR>]
+
+  status   [--source PATH] [--mcp-url <URL>]
+
+  config   show | set-default-mode <MODE> | path
 ```
 
 ## Why a separate binary
