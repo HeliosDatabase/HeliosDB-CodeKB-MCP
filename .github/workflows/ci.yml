@@ -1,0 +1,95 @@
+# Plugin CI — runs on every push and PR.
+#
+# Heavy compile cost (engine path-dep is large) so we cache aggressively
+# and only run the full matrix on tag pushes via release.yml.
+
+name: ci
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+# Cancel superseded runs on the same ref.
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: always
+  # The engine is a path-dep right now — once it's published this can
+  # come from crates.io and the engine checkout step in jobs goes away.
+  HELIOS_NANO_REPO: Dimensigon/HDB-HeliosDB-Nano
+
+jobs:
+  fmt:
+    name: cargo fmt
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt
+      - run: cargo fmt --all --check
+
+  clippy:
+    name: cargo clippy
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          path: heliosdb-codekb-mcp
+      # The plugin's Cargo.toml has `path = "../Nano"` for the engine.
+      - uses: actions/checkout@v4
+        with:
+          repository: ${{ env.HELIOS_NANO_REPO }}
+          path: Nano
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: heliosdb-codekb-mcp
+      - working-directory: heliosdb-codekb-mcp
+        run: cargo clippy --all-targets -- -D warnings
+
+  test:
+    name: cargo test
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          path: heliosdb-codekb-mcp
+      - uses: actions/checkout@v4
+        with:
+          repository: ${{ env.HELIOS_NANO_REPO }}
+          path: Nano
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: heliosdb-codekb-mcp
+      - working-directory: heliosdb-codekb-mcp
+        run: cargo test --tests
+      - working-directory: heliosdb-codekb-mcp
+        run: cargo test --doc
+
+  no-default-features:
+    # Prove the leaner `--no-default-features` build still compiles
+    # (PDF/DOCX/XLSX disabled, native-binary-docs feature off).
+    name: cargo check --no-default-features
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          path: heliosdb-codekb-mcp
+      - uses: actions/checkout@v4
+        with:
+          repository: ${{ env.HELIOS_NANO_REPO }}
+          path: Nano
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: heliosdb-codekb-mcp
+      - working-directory: heliosdb-codekb-mcp
+        run: cargo check --no-default-features

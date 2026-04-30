@@ -1,0 +1,122 @@
+# Plugin release — fires on `v*` tags, builds the matrix, uploads
+# binaries to a GitHub Release.  Tier 3 #16 in ROADMAP.md.
+
+name: release
+
+on:
+  push:
+    tags: ["v*"]
+
+permissions:
+  contents: write   # for `gh release` artifact upload
+
+env:
+  CARGO_TERM_COLOR: always
+  HELIOS_NANO_REPO: Dimensigon/HDB-HeliosDB-Nano
+
+jobs:
+  build:
+    name: ${{ matrix.os }} / ${{ matrix.target }}
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          # linux x86_64 — the most-used pilot platform.
+          - os: ubuntu-latest
+            target: x86_64-unknown-linux-gnu
+            artifact: heliosdb-codekb-mcp-linux-x86_64
+          # linux aarch64 — server / edge use.
+          - os: ubuntu-latest
+            target: aarch64-unknown-linux-gnu
+            cross: true
+            artifact: heliosdb-codekb-mcp-linux-aarch64
+          # macOS arm64 (M-series) — modern dev machines.
+          - os: macos-latest
+            target: aarch64-apple-darwin
+            artifact: heliosdb-codekb-mcp-macos-aarch64
+          # macOS x86_64 (Intel) — older dev machines.
+          - os: macos-13
+            target: x86_64-apple-darwin
+            artifact: heliosdb-codekb-mcp-macos-x86_64
+
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          path: heliosdb-codekb-mcp
+      - uses: actions/checkout@v4
+        with:
+          repository: ${{ env.HELIOS_NANO_REPO }}
+          path: Nano
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: heliosdb-codekb-mcp
+          key: ${{ matrix.target }}
+
+      # `cross` for foreign-arch Linux; native cargo for everything else.
+      - name: Install cross (aarch64 linux only)
+        if: matrix.cross
+        run: cargo install cross --locked
+
+      - name: Build
+        working-directory: heliosdb-codekb-mcp
+        env:
+          CARGO_BUILD_TARGET: ${{ matrix.target }}
+        run: |
+          if [ "${{ matrix.cross }}" = "true" ]; then
+            cross build --release --target ${{ matrix.target }}
+          else
+            cargo build --release --target ${{ matrix.target }}
+          fi
+
+      - name: Strip binary (Unix only — keeps the artefact small)
+        working-directory: heliosdb-codekb-mcp/target/${{ matrix.target }}/release
+        run: |
+          if [ -f heliosdb-codekb-mcp ]; then
+            strip heliosdb-codekb-mcp || true
+          fi
+
+      - name: Compute sha256
+        working-directory: heliosdb-codekb-mcp/target/${{ matrix.target }}/release
+        run: |
+          if command -v sha256sum >/dev/null; then
+            sha256sum heliosdb-codekb-mcp > heliosdb-codekb-mcp.sha256
+          else
+            shasum -a 256 heliosdb-codekb-mcp > heliosdb-codekb-mcp.sha256
+          fi
+
+      - name: Package
+        working-directory: heliosdb-codekb-mcp/target/${{ matrix.target }}/release
+        run: |
+          mkdir -p ../../../release
+          cp heliosdb-codekb-mcp ../../../release/${{ matrix.artifact }}
+          cp heliosdb-codekb-mcp.sha256 ../../../release/${{ matrix.artifact }}.sha256
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.artifact }}
+          path: heliosdb-codekb-mcp/release/
+
+  publish:
+    name: gh release
+    needs: build
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/download-artifact@v4
+        with:
+          path: ./release
+          merge-multiple: true
+      - name: Create GitHub Release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          gh release create "${GITHUB_REF_NAME}" \
+            --title "${GITHUB_REF_NAME}" \
+            --generate-notes \
+            ./release/*
