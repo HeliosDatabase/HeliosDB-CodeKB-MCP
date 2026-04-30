@@ -212,12 +212,14 @@ pub fn ingest(db: &EmbeddedDatabase, opts: IngestOptions) -> Result<IngestSummar
     ensure_tables(db)?;
 
     // Background-quality child path: parent already populated `src`
-    // and `docs`; re-running `walk_and_upsert` would trip the
-    // cross-process `ON CONFLICT` bug (engine FR
-    // `cross_process_on_conflict`, ROADMAP #7) and double the row
-    // count. Trust what's on disk and let `code_index(force_reparse
-    // = true)` rewrite `_hdb_code_symbols` cleanly via its
-    // delete-by-file_id path.
+    // and `docs`. Skipping the re-walk in the child is now a *perf
+    // optimisation* — avoids redundant filesystem walk + per-file
+    // upserts that the parent already committed. (Originally a
+    // correctness workaround for engine FR
+    // `cross_process_on_conflict`; the engine fix landed in branch
+    // `feat/cross-process-conflict-and-cache-stats` commit `6ec74d3`,
+    // so removing the gate would also be safe — keeping it for the
+    // perf win on large repos.)
     let is_quality_child = std::env::var(crate::quality::PROGRESS_ENV).is_ok();
 
     if !is_quality_child {
