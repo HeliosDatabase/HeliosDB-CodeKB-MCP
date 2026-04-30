@@ -176,6 +176,16 @@ enum Commands {
     Status {
         #[arg(long)]
         source: Option<PathBuf>,
+
+        /// If a `serve --http <addr>` is running for this source,
+        /// fetch live cache stats from it. Best-effort: a dead /
+        /// unreachable URL prints a one-line note but doesn't fail.
+        /// The cache lives in the SERVING process; without this
+        /// flag the cache stats can't be retrieved by the separate
+        /// `status` invocation (the engine's `result_cache` is a
+        /// per-process static).
+        #[arg(long, value_name = "URL", requires = "source")]
+        mcp_url: Option<String>,
     },
 
     /// Read or update a value in the config TOML.
@@ -261,7 +271,7 @@ async fn main() -> Result<()> {
             };
             run_and_print_ingest(&opts)
         }
-        Commands::Status { source } => status(source.as_deref()),
+        Commands::Status { source, mcp_url } => status(source.as_deref(), mcp_url.as_deref()),
         Commands::Config { action } => match action {
             ConfigAction::Show => {
                 let cfg = Config::load_or_default()?;
@@ -372,7 +382,7 @@ fn init(source: &std::path::Path, mode: KbMode, kb_override: Option<&std::path::
     Ok(())
 }
 
-fn status(source: Option<&std::path::Path>) -> Result<()> {
+fn status(source: Option<&std::path::Path>, mcp_url: Option<&str>) -> Result<()> {
     let cfg = Config::load_or_default()?;
     if let Some(s) = source {
         let s = s.canonicalize()?;
@@ -388,6 +398,9 @@ fn status(source: Option<&std::path::Path>) -> Result<()> {
                 }
                 print_resume_state(&spec.kb_dir);
                 print_quality_phase(&spec.kb_dir);
+                if let Some(url) = mcp_url {
+                    print_mcp_cache_stats(url);
+                }
             }
             None => {
                 println!("no KB configured for {}", s.display());
@@ -402,6 +415,53 @@ fn status(source: Option<&std::path::Path>) -> Result<()> {
         }
     }
     Ok(())
+}
+
+/// Best-effort fetch + render of `cache` from the running MCP
+/// server's `/info` endpoint.  Cache state is per-process (the
+/// engine's `result_cache` is a `static`), so the only way for
+/// `status` to see it is to talk to the live server.  A failure
+/// is downgraded to a one-line note — never an exit code.
+fn print_mcp_cache_stats(url: &str) {
+    let info_url = if url.trim_end_matches('/').ends_with("/info") {
+        url.to_string()
+    } else {
+        format!("{}/info", url.trim_end_matches('/'))
+    };
+    let resp = match ureq::get(&info_url)
+        .timeout(std::time::Duration::from_millis(750))
+        .call()
+    {
+        Ok(r) => r,
+        Err(e) => {
+            println!("mcp cache : (could not reach {info_url}: {e})");
+            return;
+        }
+    };
+    let info: serde_json::Value = match resp.into_json() {
+        Ok(v) => v,
+        Err(e) => {
+            println!("mcp cache : (response from {info_url} was not JSON: {e})");
+            return;
+        }
+    };
+    let cache = match info.get("cache") {
+        Some(c) if c.is_object() => c,
+        _ => {
+            println!("mcp cache : (server at {info_url} did not include `cache` field)");
+            return;
+        }
+    };
+    let size = cache.get("size").and_then(|v| v.as_u64()).unwrap_or(0);
+    let cap = cache.get("capacity").and_then(|v| v.as_u64()).unwrap_or(0);
+    let gen_n = cache.get("generation").and_then(|v| v.as_u64()).unwrap_or(0);
+    let hits = cache.get("hits").and_then(|v| v.as_u64()).unwrap_or(0);
+    let misses = cache.get("misses").and_then(|v| v.as_u64()).unwrap_or(0);
+    let hit_rate = cache.get("hit_rate").and_then(|v| v.as_f64()).unwrap_or(0.0);
+    println!(
+        "mcp cache : {size} / {cap} entries, {:.1}% hit rate ({hits} hit / {misses} miss), gen {gen_n}",
+        hit_rate * 100.0,
+    );
 }
 
 /// Pretty-print the ingest resume state (`.ingest-state.json`).
