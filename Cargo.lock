@@ -2128,6 +2128,8 @@ dependencies = [
 [[package]]
 name = "heliosdb-nano"
 version = "3.22.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "4e99b4e99819ad6d3fd079a66b5692d2af4c5a7dd4ea5bb05bd33a9b781b6209"
 dependencies = [
  "aes-gcm",
  "argon2",
