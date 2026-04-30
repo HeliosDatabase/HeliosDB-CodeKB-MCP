@@ -93,6 +93,15 @@ enum Commands {
         /// source.
         #[arg(long, default_value_t = false)]
         durable_writes: bool,
+
+        /// Populate `body_vec` on `_hdb_code_symbols` using the
+        /// in-process FastEmbedder (BGE-Small-EN-V1.5, 384-dim).
+        /// First run downloads ~30 MB of model weights to
+        /// `$XDG_CACHE_HOME/.fastembed_cache`. Lifts
+        /// `helios_graphrag_search` quality for paraphrase-style
+        /// queries. ROADMAP.md Tier 0.
+        #[arg(long, default_value_t = false)]
+        with_embeddings: bool,
     },
 
     /// Walk the source tree, classify and upsert files, run the
@@ -119,6 +128,13 @@ enum Commands {
         /// don't mind the slowdown.
         #[arg(long, default_value_t = false)]
         durable_writes: bool,
+
+        /// Populate `body_vec` on `_hdb_code_symbols` using the
+        /// in-process FastEmbedder (BGE-Small-EN-V1.5, 384-dim).
+        /// First run downloads ~30 MB of model weights to
+        /// `$XDG_CACHE_HOME/.fastembed_cache`. ROADMAP.md Tier 0.
+        #[arg(long, default_value_t = false)]
+        with_embeddings: bool,
     },
 
     /// Show config and per-KB stats. No `--source` ⇒ global summary.
@@ -166,6 +182,7 @@ async fn main() -> Result<()> {
             include_binary_docs,
             force,
             durable_writes,
+            with_embeddings,
         } => {
             let mode = KbMode::parse(&mode)?;
             init(&source, mode, kb.as_deref())?;
@@ -177,6 +194,7 @@ async fn main() -> Result<()> {
                     include_binary_docs,
                     force_reparse: force,
                     durable_writes,
+                    with_embeddings,
                 };
                 run_and_print_ingest(&opts)?;
             }
@@ -187,12 +205,14 @@ async fn main() -> Result<()> {
             include_binary_docs,
             force,
             durable_writes,
+            with_embeddings,
         } => {
             let opts = IngestOptions {
                 source_root: source.canonicalize()?,
                 include_binary_docs,
                 force_reparse: force,
                 durable_writes,
+                with_embeddings,
             };
             run_and_print_ingest(&opts)
         }
