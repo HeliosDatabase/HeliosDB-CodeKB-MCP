@@ -7,6 +7,7 @@
 
 use std::fs;
 use std::path::PathBuf;
+use std::sync::Mutex;
 
 // `#[path]` imports must live at the test crate's root so the
 // `crate::kb` reference inside `config.rs` resolves — putting them
@@ -17,8 +18,15 @@ mod kb;
 #[path = "../src/config.rs"]
 mod config;
 
+// Both tests below mutate process-global env vars (`XDG_CONFIG_HOME`
+// / `XDG_DATA_HOME`).  Cargo runs tests in parallel by default, so
+// without serialisation they race each other.  This Mutex is held
+// for the lifetime of each test body.
+static ENV_LOCK: Mutex<()> = Mutex::new(());
+
 #[test]
 fn config_toml_round_trip_in_temp_xdg_home() {
+    let _guard = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
     let tmp = tempfile::tempdir().unwrap();
     // Force directories::ProjectDirs to land inside the tempdir.
     std::env::set_var("XDG_CONFIG_HOME", tmp.path().join("config"));
@@ -49,6 +57,7 @@ fn config_toml_round_trip_in_temp_xdg_home() {
 
 #[test]
 fn longest_prefix_lookup_for_hybrid() {
+    let _guard = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
     let tmp = tempfile::tempdir().unwrap();
     std::env::set_var("XDG_CONFIG_HOME", tmp.path().join("config"));
     std::env::set_var("XDG_DATA_HOME", tmp.path().join("data"));
