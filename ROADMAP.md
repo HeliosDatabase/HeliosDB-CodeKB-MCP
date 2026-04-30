@@ -20,7 +20,7 @@ item in one place.  Tier 0 = "next on the bench"; Tier 5 =
 
 | # | Item | Effort | Impact |
 |---|---|---|---|
-| 2 | **Expose `result_cache::stats()` via `helios/info`** | XS | Ops visibility. Cache hit rate / capacity surfaced via JSON-RPC. **Engine-side**: needs an `helios/info` field; plugin reflects through. (Propose options before filing.) |
+| 2 | **Expose `result_cache::stats()` via `helios/info`** — *engine half closed by `26956ba` on `feat/cross-process-conflict-and-cache-stats`*. `helios/info` (JSON-RPC) and `GET /mcp/info` (HTTP) now include a `cache: { size, capacity, generation, hits, misses, evictions, hit_rate }` field. Plugin-side `status` reflection is the remaining piece (XS, queued for next plugin commit). | XS | Ops visibility. |
 | 3 | **Plugin ingest contract tests** | M | Today's `tests/config_smoke.rs` covers config only. End-to-end ingest tests would catch regressions across plugin ↔ engine version transitions. |
 | 4 | **`.gitattributes linguist-generated` honour** — *closed by `<commit>`*. `<root>/.gitattributes` and `<root>/.git/info/attributes` parsed for `linguist-generated[=true|=set]` glob patterns, matched against relative paths in the walk loop, alongside the existing `@generated` 4-KiB content-marker check. | S | GitHub-Linguist polish.  Long tail of generated files. |
 | 5 | **Resume-on-interrupt for cold ingest** | M-L | Killing a cold ingest mid-flight loses all work today.  Needs a checkpoint state machine. Adoption blocker for very large repos. |
@@ -30,7 +30,7 @@ item in one place.  Tier 0 = "next on the bench"; Tier 5 =
 
 | # | Item | Status |
 |---|---|---|
-| 7 | `FEATURE_REQUEST_cross_process_on_conflict.md` | open. **Field-confirmed during `--background-quality` smoke test:** parent inserts 2 rows in `src`; child reopens the same KB and a plain `walk_and_upsert` doubles `src` to 4 rows even though every INSERT is `ON CONFLICT(path) DO UPDATE`. Plugin works around this by **skipping `walk_and_upsert` in the quality child** — the child only re-runs `code_index(force_reparse=true)` against the parent's already-committed `src` rows.  See `src/ingest.rs::ingest()` and `src/quality.rs`. |
+| 7 | `FEATURE_REQUEST_cross_process_on_conflict.md` | **fixed on engine branch `feat/cross-process-conflict-and-cache-stats` (`6ec74d3`)**. Two divergences fixed: `insert_tuple_versioned_with_schema` now calls `check_unique_constraints` (matching the SQL fast-path sibling); `execute_plan_with_params_inner`'s INSERT arm now honours `on_conflict` (DoNothing / DoUpdate). Plugin's "skip walk in child" workaround can be removed once the engine pin advances. |
 | 8 | `BUGS_MCP_SERVER_CLI_DOCS.md` (option a — docstring fix) | filed 2026-04-26.  Quick doc PR. |
 | 9 | True multi-threaded multi-writer for `_hdb_code_*` (full `parallel_writes` scope) | gated on `Sync`-ing the catalog / ART / transaction state.  Substantial engine refactor.  **Pilot's 5-min target already met without it** — revisit only if a > 10 k file repo workload lands. |
 | 10 | `streaming_pipeline` parse-write overlap | marginal at 12 % post-batched-drain (commit `7bb58c2`). Revisit at 10 k+ file scale. |
