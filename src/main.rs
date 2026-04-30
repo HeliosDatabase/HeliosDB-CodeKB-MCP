@@ -31,10 +31,12 @@ use heliosdb_nano::EmbeddedDatabase;
 mod config;
 mod ingest;
 mod kb;
+mod quality;
 
 use config::Config;
 use ingest::{ingest as run_ingest, open_kb_for_ingest, IngestOptions};
 use kb::{KbMode, KbSpec};
+use quality::{Phase, QualityProgress};
 
 #[derive(Parser)]
 #[command(
@@ -102,6 +104,16 @@ enum Commands {
         /// queries. ROADMAP.md Tier 0.
         #[arg(long, default_value_t = false)]
         with_embeddings: bool,
+
+        /// Fast pass first, then spawn a detached child for the
+        /// embedding pass. User gets back control after the fast
+        /// pass; queries already work (BM25 + hop-distance).
+        /// Paraphrase quality comes online once the child finishes.
+        /// Recommended for repos with >~1 k files. Implies
+        /// `--with-embeddings` for the background phase. Track via
+        /// `status --source <PWD>`.
+        #[arg(long, default_value_t = false)]
+        background_quality: bool,
     },
 
     /// Walk the source tree, classify and upsert files, run the
@@ -135,6 +147,16 @@ enum Commands {
         /// `$XDG_CACHE_HOME/.fastembed_cache`. ROADMAP.md Tier 0.
         #[arg(long, default_value_t = false)]
         with_embeddings: bool,
+
+        /// Fast pass first, then spawn a detached child for the
+        /// embedding pass. User gets back control after the fast
+        /// pass; queries already work (BM25 + hop-distance).
+        /// Paraphrase quality comes online once the child finishes.
+        /// Recommended for repos with >~1 k files. Implies
+        /// `--with-embeddings` for the background phase. Track via
+        /// `status --source <PWD>`.
+        #[arg(long, default_value_t = false)]
+        background_quality: bool,
     },
 
     /// Show config and per-KB stats. No `--source` ⇒ global summary.
@@ -183,6 +205,7 @@ async fn main() -> Result<()> {
             force,
             durable_writes,
             with_embeddings,
+            background_quality,
         } => {
             let mode = KbMode::parse(&mode)?;
             init(&source, mode, kb.as_deref())?;
@@ -195,6 +218,7 @@ async fn main() -> Result<()> {
                     force_reparse: force,
                     durable_writes,
                     with_embeddings,
+                    background_quality,
                 };
                 run_and_print_ingest(&opts)?;
             }
@@ -206,6 +230,7 @@ async fn main() -> Result<()> {
             force,
             durable_writes,
             with_embeddings,
+            background_quality,
         } => {
             let opts = IngestOptions {
                 source_root: source.canonicalize()?,
@@ -213,6 +238,7 @@ async fn main() -> Result<()> {
                 force_reparse: force,
                 durable_writes,
                 with_embeddings,
+                background_quality,
             };
             run_and_print_ingest(&opts)
         }
@@ -305,6 +331,7 @@ fn status(source: Option<&std::path::Path>) -> Result<()> {
                 } else {
                     println!("kb-on-disk : missing — run `init` again");
                 }
+                print_quality_phase(&spec.kb_dir);
             }
             None => {
                 println!("no KB configured for {}", s.display());
@@ -321,6 +348,55 @@ fn status(source: Option<&std::path::Path>) -> Result<()> {
     Ok(())
 }
 
+/// Pretty-print the quality phase (background-embedding child) state.
+/// No-op when no progress file exists.
+fn print_quality_phase(kb_dir: &std::path::Path) {
+    let path = quality::progress_path(kb_dir);
+    let progress = match quality::read(&path) {
+        Ok(p) => p,
+        Err(e) => {
+            println!("quality phase : (error reading {}: {e})", path.display());
+            return;
+        }
+    };
+    match quality::classify(progress) {
+        Phase::NotStarted => {
+            // Don't print anything — silence is the right default.
+        }
+        Phase::Running { p, alive } => {
+            let now = quality::now_secs();
+            let elapsed = now.saturating_sub(p.started_at_secs);
+            if alive {
+                println!(
+                    "quality phase : running — pid {} ({} elapsed)",
+                    p.pid,
+                    quality::fmt_duration_secs(elapsed)
+                );
+            } else {
+                println!(
+                    "quality phase : stale — pid {} not running and no completion recorded",
+                    p.pid
+                );
+                println!("              : tail {} or re-run `ingest --background-quality`", p.log_path);
+            }
+            println!("              : log → {}", p.log_path);
+        }
+        Phase::Complete { p } => {
+            let took = p
+                .completed_at_secs
+                .unwrap_or(p.started_at_secs)
+                .saturating_sub(p.started_at_secs);
+            let now = quality::now_secs();
+            let ago = now.saturating_sub(p.completed_at_secs.unwrap_or(now));
+            println!(
+                "quality phase : complete — took {}, finished {} ago",
+                quality::fmt_duration_secs(took),
+                quality::fmt_duration_secs(ago)
+            );
+        }
+    }
+}
+
 fn run_and_print_ingest(opts: &IngestOptions) -> Result<()> {
     let cfg = Config::load_or_default()?;
     let spec = cfg.lookup_for_source(&opts.source_root).with_context(|| {
@@ -330,8 +406,40 @@ fn run_and_print_ingest(opts: &IngestOptions) -> Result<()> {
             opts.source_root.display(),
         )
     })?;
+
+    // Detect "are we the detached background-quality child?" — the
+    // parent sets `HELIOS_QUALITY_PROGRESS_FILE` on the child's env
+    // when it spawns it.  The child runs the embedding pass inline
+    // and finalises the progress file at the end.
+    let is_quality_child = std::env::var(quality::PROGRESS_ENV).is_ok();
+
+    // Choose the inline ingest options. Three cases:
+    //   * Quality child  → with_embeddings=true, force_reparse=true.
+    //   * Parent w/ bg-quality → with_embeddings=false (defer to
+    //     child); user-specified force_reparse honoured.
+    //   * Plain run → use the user's flags as-is.
+    let inline_opts = if is_quality_child {
+        IngestOptions {
+            with_embeddings: true,
+            force_reparse: true,
+            background_quality: false,
+            ..opts.clone()
+        }
+    } else if opts.background_quality {
+        IngestOptions {
+            with_embeddings: false,
+            background_quality: false,
+            ..opts.clone()
+        }
+    } else {
+        IngestOptions {
+            background_quality: false,
+            ..opts.clone()
+        }
+    };
+
     let db = open_kb_for_ingest(&spec.kb_dir, opts.durable_writes)?;
-    let summary = run_ingest(&db, opts.clone())?;
+    let summary = run_ingest(&db, inline_opts.clone())?;
 
     eprintln!("ingest summary");
     eprintln!("  source        : {}", opts.source_root.display());
@@ -386,6 +494,100 @@ fn run_and_print_ingest(opts: &IngestOptions) -> Result<()> {
             d.nodes_added, d.edges_added, d.rows_seen, d.rows_skipped
         );
     }
+
+    // Release the embedded DB before either finalising progress or
+    // forking a child — the engine doesn't yet support concurrent
+    // multi-process writes (FR #9 in ROADMAP, deferred).
+    drop(db);
+
+    if is_quality_child {
+        // We are the background child; mark the progress file complete.
+        let progress_path = quality::progress_path(&spec.kb_dir);
+        quality::finalize(&progress_path)
+            .with_context(|| format!("finalise {}", progress_path.display()))?;
+    } else if opts.background_quality {
+        spawn_quality_child(&opts.source_root, &spec.kb_dir, opts.durable_writes)?;
+    }
+
+    Ok(())
+}
+
+/// Fork a detached `heliosdb-codekb-mcp ingest --with-embeddings
+/// --force` child. Parent returns immediately. Child writes progress
+/// to `<kb_dir>/quality-progress.json` and stderr to
+/// `<kb_dir>/quality.log`; `setsid(2)` puts it in its own session
+/// so the user closing the launching TTY doesn't SIGHUP it.
+fn spawn_quality_child(
+    source_root: &std::path::Path,
+    kb_dir: &std::path::Path,
+    durable_writes: bool,
+) -> Result<()> {
+    let progress_path = quality::progress_path(kb_dir);
+    let log_path = quality::log_path(kb_dir);
+
+    // Truncate previous log (one fresh log per quality run).
+    let log_file = std::fs::File::create(&log_path)
+        .with_context(|| format!("create {}", log_path.display()))?;
+    let stderr_file = log_file.try_clone()?;
+
+    let exe = std::env::current_exe().context("locate current_exe")?;
+    let mut cmd = std::process::Command::new(&exe);
+    cmd.arg("ingest")
+        .arg("--source").arg(source_root)
+        .arg("--with-embeddings")
+        .arg("--force");
+    if durable_writes {
+        cmd.arg("--durable-writes");
+    }
+    cmd.stdin(std::process::Stdio::null())
+        .stdout(log_file)
+        .stderr(stderr_file)
+        .env(quality::PROGRESS_ENV, &progress_path);
+
+    // setsid(2) — child becomes its own session leader, detached
+    // from the parent's controlling TTY. Without this the child
+    // dies on SIGHUP when the user closes the launching shell.
+    #[cfg(unix)]
+    {
+        use std::os::unix::process::CommandExt;
+        unsafe {
+            cmd.pre_exec(|| {
+                if libc::setsid() == -1 {
+                    return Err(std::io::Error::last_os_error());
+                }
+                Ok(())
+            });
+        }
+    }
+
+    let child = cmd.spawn().context("spawn quality child")?;
+    let pid = child.id();
+
+    // Initial progress JSON — parent owns it; child finalises.
+    let progress = QualityProgress {
+        pid,
+        started_at_secs: quality::now_secs(),
+        completed_at_secs: None,
+        log_path: log_path.to_string_lossy().into_owned(),
+        source_root: source_root.to_string_lossy().into_owned(),
+    };
+    quality::write(&progress_path, &progress)
+        .with_context(|| format!("write {}", progress_path.display()))?;
+
+    eprintln!();
+    eprintln!("background quality phase started:");
+    eprintln!("  pid       : {pid}");
+    eprintln!("  log       : {}", log_path.display());
+    eprintln!("  progress  : {}", progress_path.display());
+    eprintln!();
+    eprintln!("Track via:");
+    eprintln!("  heliosdb-codekb-mcp status --source {}", source_root.display());
+    eprintln!();
+    eprintln!("MCP queries can already use the index (BM25 + hop-distance);");
+    eprintln!("paraphrase quality lifts once the embedding pass finishes.");
+
+    // Don't wait. Detach by dropping the Child handle.
+    drop(child);
     Ok(())
 }
 

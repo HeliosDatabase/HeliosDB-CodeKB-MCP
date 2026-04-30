@@ -14,15 +14,15 @@ item in one place.  Tier 0 = "next on the bench"; Tier 5 =
 
 | # | Item | Effort | Impact |
 |---|---|---|---|
-| 1 | **Re-enable body embeddings** (`embed_bodies = true`) — bench cold ingest with the in-process FastEmbedder.  If still under 5 min on the pilot corpus, ship as the new default; else gate behind `--with-embeddings`. | S | Major **`helios_graphrag_search` quality** lift. Today's BM25 + hop-distance ranking misses paraphrases. |
+| 1 | **Re-enable body embeddings** — *closed by `05ed683`*. Inline `--with-embeddings` ships as opt-in (3 m 14 s pilot); `--background-quality` (`<commit>`) keeps the user wait at the fast-pass cost while the embedding pass runs in a detached child. | S | Major **`helios_graphrag_search` quality** lift, no longer at the cost of user wait time on large repos. |
 
 ## Tier 1 — small, contained, plugin-side
 
 | # | Item | Effort | Impact |
 |---|---|---|---|
-| 2 | **Expose `result_cache::stats()` via `helios/info`** | XS | Ops visibility. Cache hit rate / capacity surfaced via JSON-RPC. |
+| 2 | **Expose `result_cache::stats()` via `helios/info`** | XS | Ops visibility. Cache hit rate / capacity surfaced via JSON-RPC. **Engine-side**: needs an `helios/info` field; plugin reflects through. (Propose options before filing.) |
 | 3 | **Plugin ingest contract tests** | M | Today's `tests/config_smoke.rs` covers config only. End-to-end ingest tests would catch regressions across plugin ↔ engine version transitions. |
-| 4 | **`.gitattributes linguist-generated` honour** | S | GitHub-Linguist polish.  The `@generated` marker scan covers ~80 % of cases; this is the long tail. |
+| 4 | **`.gitattributes linguist-generated` honour** — *closed by `<commit>`*. `<root>/.gitattributes` and `<root>/.git/info/attributes` parsed for `linguist-generated[=true|=set]` glob patterns, matched against relative paths in the walk loop, alongside the existing `@generated` 4-KiB content-marker check. | S | GitHub-Linguist polish.  Long tail of generated files. |
 | 5 | **Resume-on-interrupt for cold ingest** | M-L | Killing a cold ingest mid-flight loses all work today.  Needs a checkpoint state machine. Adoption blocker for very large repos. |
 | 6 | **HTTP transport option in the plugin** | M | Engine already exposes `/mcp` HTTP / WS / SSE.  Plugin spawns stdio only. Adding HTTP unlocks Cursor and other clients. |
 
@@ -30,7 +30,7 @@ item in one place.  Tier 0 = "next on the bench"; Tier 5 =
 
 | # | Item | Status |
 |---|---|---|
-| 7 | `FEATURE_REQUEST_cross_process_on_conflict.md` | engine team's own FR. Causes force-reparse to be slow when `src` table has duplicate-path rows. Real but rare in practice. |
+| 7 | `FEATURE_REQUEST_cross_process_on_conflict.md` | open. **Field-confirmed during `--background-quality` smoke test:** parent inserts 2 rows in `src`; child reopens the same KB and a plain `walk_and_upsert` doubles `src` to 4 rows even though every INSERT is `ON CONFLICT(path) DO UPDATE`. Plugin works around this by **skipping `walk_and_upsert` in the quality child** — the child only re-runs `code_index(force_reparse=true)` against the parent's already-committed `src` rows.  See `src/ingest.rs::ingest()` and `src/quality.rs`. |
 | 8 | `BUGS_MCP_SERVER_CLI_DOCS.md` (option a — docstring fix) | filed 2026-04-26.  Quick doc PR. |
 | 9 | True multi-threaded multi-writer for `_hdb_code_*` (full `parallel_writes` scope) | gated on `Sync`-ing the catalog / ART / transaction state.  Substantial engine refactor.  **Pilot's 5-min target already met without it** — revisit only if a > 10 k file repo workload lands. |
 | 10 | `streaming_pipeline` parse-write overlap | marginal at 12 % post-batched-drain (commit `7bb58c2`). Revisit at 10 k+ file scale. |
@@ -67,7 +67,10 @@ item in one place.  Tier 0 = "next on the bench"; Tier 5 =
 | v3.22.0 | + Tier 2.4 v2 direct-write | 3 m 42 s | 3.7× |
 | v3.22.1 | + FK txn-write-set merge | 3 m 46 s | 3.6× |
 | v3.22.1 + plugin Async wal_sync | regenerable-index Async fsync | 1 m 42 s | 8.0× |
-| **v3.22.1 + Async + cross-file bulk batching (`7bb58c2`)** | **current state** | **26.4 s** | **31.0×** |
+| **v3.22.1 + Async + cross-file bulk batching (`7bb58c2`)** | **current state — fast tier** | **26.4 s** | **31.0×** |
+| v3.22.1 + Async + bulk-batch + `--with-embeddings` (inline) | quality tier, blocking | 3 m 14.9 s | 4.2× |
+| **v3.22.1 + Async + bulk-batch + `--background-quality`** | **user wait time** | **~26 s** | **31×** (unchanged) |
+| same | total wall (parent + detached child) | ~3 m 15 s | 4.2× |
 
 ## How to read this file
 

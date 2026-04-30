@@ -25,6 +25,7 @@ use std::path::{Path, PathBuf};
 use std::time::Instant;
 
 use anyhow::{Context, Result};
+use globset::{Glob, GlobSet, GlobSetBuilder};
 use heliosdb_nano::code_graph::{CodeIndexOptions, CodeIndexStats};
 use heliosdb_nano::config::{Config as EngineConfig, WalSyncModeConfig};
 use heliosdb_nano::graph_rag::{ChunkStrategy, IngestDocsOptions, IngestStats as DocStats};
@@ -133,6 +134,14 @@ pub struct IngestOptions {
     /// but the bench result is the source of truth — see
     /// ROADMAP.md Tier 0.
     pub with_embeddings: bool,
+    /// When true, the binary's parent invocation runs the fast pass
+    /// synchronously (no embeddings) and then spawns a detached child
+    /// to do the embedding pass. The user gets back control after
+    /// ~26 s on the pilot corpus instead of ~3 m 15 s. Progress is
+    /// surfaced via `status --source X`. Recommended for repos with
+    /// >~1 k files where a blocking embedding pass is awkward. See
+    /// `crate::quality` for the progress-file contract.
+    pub background_quality: bool,
 }
 
 #[derive(Debug, Default)]
@@ -202,18 +211,56 @@ pub fn ingest(db: &EmbeddedDatabase, opts: IngestOptions) -> Result<IngestSummar
 
     ensure_tables(db)?;
 
-    // Bulk-upsert path: one transaction around the whole walk so the
-    // engine pays durability overhead once instead of per-row. RAII
-    // guard rolls back on any error during the loop.
-    let txn = TxnGuard::begin(db)?;
-    let walk_result = walk_and_upsert(db, &opts, &mut summary);
-    match walk_result {
-        Ok(()) => txn.commit()?,
-        Err(e) => {
-            // ROLLBACK is best-effort — we surface the original walk error.
-            let _ = txn.rollback();
-            return Err(e);
+    // Background-quality child path: parent already populated `src`
+    // and `docs`; re-running `walk_and_upsert` would trip the
+    // cross-process `ON CONFLICT` bug (engine FR
+    // `cross_process_on_conflict`, ROADMAP #7) and double the row
+    // count. Trust what's on disk and let `code_index(force_reparse
+    // = true)` rewrite `_hdb_code_symbols` cleanly via its
+    // delete-by-file_id path.
+    let is_quality_child = std::env::var(crate::quality::PROGRESS_ENV).is_ok();
+
+    if !is_quality_child {
+        // Bulk-upsert path: one transaction around the whole walk so
+        // the engine pays durability overhead once instead of
+        // per-row. RAII guard rolls back on any error during the
+        // loop.
+        let txn = TxnGuard::begin(db)?;
+        let walk_result = walk_and_upsert(db, &opts, &mut summary);
+        match walk_result {
+            Ok(()) => txn.commit()?,
+            Err(e) => {
+                // ROLLBACK is best-effort — surface the original walk error.
+                let _ = txn.rollback();
+                return Err(e);
+            }
         }
+    } else {
+        // Quality child: probe row counts so the rest of the
+        // function still gates on "there is something to index".
+        if let Ok(rows) = db.query("SELECT count(*) FROM src", &[]) {
+            if let Some(n) = rows.first().and_then(|r| r.values.first()) {
+                summary.code_upserts = match n {
+                    Value::Int4(v) => *v as u64,
+                    Value::Int8(v) => *v as u64,
+                    _ => 0,
+                };
+            }
+        }
+        if let Ok(rows) = db.query("SELECT count(*) FROM docs", &[]) {
+            if let Some(n) = rows.first().and_then(|r| r.values.first()) {
+                let n = match n {
+                    Value::Int4(v) => *v as u64,
+                    Value::Int8(v) => *v as u64,
+                    _ => 0,
+                };
+                summary.doc_upserts = n;
+            }
+        }
+        eprintln!(
+            "ingest phase (quality-child): skipping walk; trusting existing src/docs rows ({} src, {} docs)",
+            summary.code_upserts, summary.doc_upserts,
+        );
     }
 
 
@@ -313,6 +360,11 @@ fn walk_and_upsert(
         })
         .build();
 
+    // `.gitattributes linguist-generated` honour. Loaded once before
+    // the walk so we don't re-parse per file. Empty / missing →
+    // `None`, and we fall back to the `is_generated_file` 4-KiB peek.
+    let linguist_skip = load_linguist_generated_globset(&opts.source_root);
+
     let mut last_progress_at = Instant::now();
     let mut last_progress_files: u64 = 0;
     let walk_started = Instant::now();
@@ -369,8 +421,21 @@ fn walk_and_upsert(
         }
 
         let class = classify(path);
+        let rel = relative_path(path, &opts.source_root);
 
-        // Generated-file skip: peek the first 4 KiB for the
+        // Generated-file skip path A: `.gitattributes linguist-generated`
+        // glob match against the relative path.  Same scope as the
+        // content-marker check (Code / Notebook only).
+        if matches!(class, Class::Code(_) | Class::Notebook) {
+            if let Some(set) = linguist_skip.as_ref() {
+                if set.is_match(&rel) {
+                    summary.skipped += 1;
+                    continue;
+                }
+            }
+        }
+
+        // Generated-file skip path B: peek the first 4 KiB for the
         // canonical "@generated" marker (Facebook / Google / Bazel
         // convention). Only applied to Code / Notebook classes —
         // text and binary doc extraction shouldn't be skipped.
@@ -378,8 +443,6 @@ fn walk_and_upsert(
             summary.skipped += 1;
             continue;
         }
-
-        let rel = relative_path(path, &opts.source_root);
 
         match class {
             Class::Code(lang) => match read_utf8(path) {
@@ -492,6 +555,73 @@ fn ensure_tables(db: &EmbeddedDatabase) -> Result<()> {
     )
     .context("create docs table")?;
     Ok(())
+}
+
+/// Parse `<root>/.gitattributes` and build a `GlobSet` of patterns
+/// flagged with `linguist-generated` (or `linguist-generated=true`).
+/// Returns `None` if the file is absent, empty of relevant entries,
+/// or fails to parse — all are non-fatal: callers degrade to the
+/// content-marker check (`is_generated_file`) only.
+///
+/// gitattributes line format we support:
+///   `<pattern> linguist-generated`
+///   `<pattern> linguist-generated=true`
+///   `<pattern> linguist-generated linguist-vendored`  (any-position attr)
+///
+/// Lines starting with `#` and blank lines are skipped. We do not
+/// honour `linguist-generated=false` (no negation today; rare in
+/// practice).  We also check `<root>/.git/info/attributes` for repo-
+/// scoped overrides — same parser.
+fn load_linguist_generated_globset(root: &Path) -> Option<GlobSet> {
+    let candidates = [
+        root.join(".gitattributes"),
+        root.join(".git").join("info").join("attributes"),
+    ];
+    let mut builder = GlobSetBuilder::new();
+    let mut count = 0usize;
+    for p in &candidates {
+        let body = match std::fs::read_to_string(p) {
+            Ok(s) => s,
+            Err(_) => continue,
+        };
+        for raw in body.lines() {
+            let line = raw.trim();
+            if line.is_empty() || line.starts_with('#') {
+                continue;
+            }
+            let mut parts = line.split_whitespace();
+            let pattern = match parts.next() {
+                Some(p) => p,
+                None => continue,
+            };
+            let mut linguist_generated = false;
+            for attr in parts {
+                if attr == "linguist-generated"
+                    || attr == "linguist-generated=true"
+                    || attr == "linguist-generated=set"
+                {
+                    linguist_generated = true;
+                    break;
+                }
+            }
+            if !linguist_generated {
+                continue;
+            }
+            // gitattributes patterns are already glob-like (`*.pb.rs`,
+            // `vendor/**`, etc.); a few have `[abc]` ranges that
+            // globset handles natively.  Build with literal_separator=false
+            // so `*` matches across slashes the way users expect for
+            // `**/*.pb.rs`.
+            if let Ok(glob) = Glob::new(pattern) {
+                builder.add(glob);
+                count += 1;
+            }
+        }
+    }
+    if count == 0 {
+        return None;
+    }
+    builder.build().ok()
 }
 
 /// Peek the first 4 KiB of the file and return true iff it contains

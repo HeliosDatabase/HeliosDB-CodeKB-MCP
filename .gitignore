@@ -4,3 +4,5 @@ Cargo.lock.bak
 .DS_Store
 *.swp
 .helios-kb/
+.fastembed_cache/
+.heliosdb_history
