@@ -112,6 +112,10 @@ const SKIP_DIRS: &[&str] = &[
 #[derive(Debug, Clone)]
 pub struct IngestOptions {
     pub source_root: PathBuf,
+    /// KB directory.  Threaded down so the checkpoint file
+    /// (`.ingest-state.json`) and the quality-progress file land
+    /// alongside the engine's RocksDB state.
+    pub kb_dir: PathBuf,
     /// When false, PDFs / DOCX / XLSX are skipped (default tier
     /// minus the binary doc decoders, useful if those crates fail
     /// to compile on a particular platform). Effectively forced
@@ -211,6 +215,22 @@ pub fn ingest(db: &EmbeddedDatabase, opts: IngestOptions) -> Result<IngestSummar
 
     ensure_tables(db)?;
 
+    // Resume-on-interrupt checkpoint — if a previous run left a
+    // checkpoint file behind, skip the phases that already
+    // completed.  Per-file resume *within* the code_index phase is
+    // handled by the engine's content-hash gate; the plugin only
+    // gates which top-level phases run.
+    let prior = crate::checkpoint::read(&opts.kb_dir)?;
+    let resume_from = prior.as_ref().map(|cp| cp.phase);
+    let source_root_str = opts.source_root.to_string_lossy().into_owned();
+    if let Some(ref cp) = prior {
+        eprintln!(
+            "ingest: resuming from interrupted run (left at phase = {:?}, started {} s ago)",
+            cp.phase,
+            crate::quality::now_secs().saturating_sub(cp.started_at_secs),
+        );
+    }
+
     // Background-quality child path: parent already populated `src`
     // and `docs`. Skipping the re-walk in the child is now a *perf
     // optimisation* — avoids redundant filesystem walk + per-file
@@ -223,18 +243,61 @@ pub fn ingest(db: &EmbeddedDatabase, opts: IngestOptions) -> Result<IngestSummar
     let is_quality_child = std::env::var(crate::quality::PROGRESS_ENV).is_ok();
 
     if !is_quality_child {
-        // Bulk-upsert path: one transaction around the whole walk so
-        // the engine pays durability overhead once instead of
-        // per-row. RAII guard rolls back on any error during the
-        // loop.
-        let txn = TxnGuard::begin(db)?;
-        let walk_result = walk_and_upsert(db, &opts, &mut summary);
-        match walk_result {
-            Ok(()) => txn.commit()?,
-            Err(e) => {
-                // ROLLBACK is best-effort — surface the original walk error.
-                let _ = txn.rollback();
-                return Err(e);
+        // Skip the walk if a prior run already finished it (resume
+        // from CodeIndex or later).  We trust the existing `src` /
+        // `docs` row counts; a fresh walk would replay them
+        // idempotently anyway, but skipping saves the wall time.
+        let skip_walk = matches!(
+            resume_from,
+            Some(crate::checkpoint::Phase::CodeIndex)
+                | Some(crate::checkpoint::Phase::GraphRag)
+        );
+
+        if skip_walk {
+            // Probe row counts so the rest of the function still
+            // gates on "is there work to do?".
+            if let Ok(rows) = db.query("SELECT count(*) FROM src", &[]) {
+                if let Some(n) = rows.first().and_then(|r| r.values.first()) {
+                    summary.code_upserts = match n {
+                        Value::Int4(v) => *v as u64,
+                        Value::Int8(v) => *v as u64,
+                        _ => 0,
+                    };
+                }
+            }
+            if let Ok(rows) = db.query("SELECT count(*) FROM docs", &[]) {
+                if let Some(n) = rows.first().and_then(|r| r.values.first()) {
+                    let n = match n {
+                        Value::Int4(v) => *v as u64,
+                        Value::Int8(v) => *v as u64,
+                        _ => 0,
+                    };
+                    summary.doc_upserts = n;
+                }
+            }
+            eprintln!(
+                "ingest phase: walk skipped (resume) — trusting existing src/docs rows ({} src, {} docs)",
+                summary.code_upserts, summary.doc_upserts,
+            );
+        } else {
+            // Mark walk in-flight before touching disk so a kill
+            // during the walk leaves a checkpoint to resume from.
+            crate::checkpoint::begin(
+                &opts.kb_dir, &source_root_str, crate::checkpoint::Phase::Walk,
+            )?;
+            // Bulk-upsert path: one transaction around the whole
+            // walk so the engine pays durability overhead once
+            // instead of per-row. RAII guard rolls back on any
+            // error during the loop.
+            let txn = TxnGuard::begin(db)?;
+            let walk_result = walk_and_upsert(db, &opts, &mut summary);
+            match walk_result {
+                Ok(()) => txn.commit()?,
+                Err(e) => {
+                    // ROLLBACK is best-effort — surface the original walk error.
+                    let _ = txn.rollback();
+                    return Err(e);
+                }
             }
         }
     } else {
@@ -268,6 +331,13 @@ pub fn ingest(db: &EmbeddedDatabase, opts: IngestOptions) -> Result<IngestSummar
 
     // Step 2: run the code-graph indexer over the `src` table.
     if summary.code_upserts > 0 {
+        // Advance the resume checkpoint — we're about to enter the
+        // expensive parse/write phase.
+        if !is_quality_child {
+            crate::checkpoint::advance(
+                &opts.kb_dir, &source_root_str, crate::checkpoint::Phase::CodeIndex,
+            )?;
+        }
         eprintln!(
             "ingest phase: walk done in {:.1} s ({} files upserted) — \
              starting code-graph indexer (parse + symbol extract + write to _hdb_code_*){}",
@@ -308,6 +378,11 @@ pub fn ingest(db: &EmbeddedDatabase, opts: IngestOptions) -> Result<IngestSummar
 
     // Step 3: run the graph-rag doc ingester over the `docs` table.
     if summary.doc_upserts + summary.binary_upserts > 0 {
+        if !is_quality_child {
+            crate::checkpoint::advance(
+                &opts.kb_dir, &source_root_str, crate::checkpoint::Phase::GraphRag,
+            )?;
+        }
         eprintln!(
             "ingest phase: starting graph-rag doc projection ({} rows)",
             summary.doc_upserts + summary.binary_upserts
@@ -330,6 +405,13 @@ pub fn ingest(db: &EmbeddedDatabase, opts: IngestOptions) -> Result<IngestSummar
             }
             Err(e) => tracing::warn!("graph_rag_ingest_docs failed: {e}"),
         }
+    }
+
+    // All phases done — clear the resume checkpoint so the next
+    // ingest doesn't think it's resuming. Quality-child path
+    // doesn't own the checkpoint (parent does), so leave it alone.
+    if !is_quality_child {
+        let _ = crate::checkpoint::clear(&opts.kb_dir);
     }
 
     summary.elapsed_ms = started.elapsed().as_millis();

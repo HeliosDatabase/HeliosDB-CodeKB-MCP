@@ -28,6 +28,7 @@ use anyhow::{Context, Result};
 use clap::{Parser, Subcommand};
 use heliosdb_nano::EmbeddedDatabase;
 
+mod checkpoint;
 mod config;
 mod ingest;
 mod kb;
@@ -222,10 +223,13 @@ async fn main() -> Result<()> {
             let mode = KbMode::parse(&mode)?;
             init(&source, mode, kb.as_deref())?;
             if ingest {
+                let canonical_source = source
+                    .canonicalize()
+                    .unwrap_or_else(|_| source.clone());
+                let kb_dir = lookup_kb_dir(&canonical_source)?;
                 let opts = IngestOptions {
-                    source_root: source
-                        .canonicalize()
-                        .unwrap_or_else(|_| source.clone()),
+                    source_root: canonical_source,
+                    kb_dir,
                     include_binary_docs,
                     force_reparse: force,
                     durable_writes,
@@ -244,8 +248,11 @@ async fn main() -> Result<()> {
             with_embeddings,
             background_quality,
         } => {
+            let canonical_source = source.canonicalize()?;
+            let kb_dir = lookup_kb_dir(&canonical_source)?;
             let opts = IngestOptions {
-                source_root: source.canonicalize()?,
+                source_root: canonical_source,
+                kb_dir,
                 include_binary_docs,
                 force_reparse: force,
                 durable_writes,
@@ -379,6 +386,7 @@ fn status(source: Option<&std::path::Path>) -> Result<()> {
                 } else {
                     println!("kb-on-disk : missing — run `init` again");
                 }
+                print_resume_state(&spec.kb_dir);
                 print_quality_phase(&spec.kb_dir);
             }
             None => {
@@ -394,6 +402,27 @@ fn status(source: Option<&std::path::Path>) -> Result<()> {
         }
     }
     Ok(())
+}
+
+/// Pretty-print the ingest resume state (`.ingest-state.json`).
+/// Silent when no checkpoint is present (the steady-state condition
+/// — `ingest` clears the file on success).
+fn print_resume_state(kb_dir: &std::path::Path) {
+    let cp = match checkpoint::read(kb_dir) {
+        Ok(Some(cp)) => cp,
+        Ok(None) => return,
+        Err(e) => {
+            println!("ingest resume : (error reading checkpoint: {e})");
+            return;
+        }
+    };
+    let now = quality::now_secs();
+    let elapsed = now.saturating_sub(cp.started_at_secs);
+    println!(
+        "ingest resume : interrupted at phase = {:?} ({} ago) — re-run `ingest` to continue",
+        cp.phase,
+        quality::fmt_duration_secs(elapsed),
+    );
 }
 
 /// Pretty-print the quality phase (background-embedding child) state.
@@ -443,6 +472,21 @@ fn print_quality_phase(kb_dir: &std::path::Path) {
             );
         }
     }
+}
+
+/// Resolve the canonical KB directory for a source root via the
+/// user's config TOML. Errors with a friendly hint if no KB has
+/// been registered for the source.
+fn lookup_kb_dir(canonical_source: &std::path::Path) -> Result<PathBuf> {
+    let cfg = Config::load_or_default()?;
+    let spec = cfg.lookup_for_source(canonical_source).with_context(|| {
+        format!(
+            "no KB configured for source `{}`. Run `heliosdb-codekb-mcp init --source {} --mode <co-located|global|hybrid>` first.",
+            canonical_source.display(),
+            canonical_source.display(),
+        )
+    })?;
+    Ok(spec.kb_dir.clone())
 }
 
 fn run_and_print_ingest(opts: &IngestOptions) -> Result<()> {

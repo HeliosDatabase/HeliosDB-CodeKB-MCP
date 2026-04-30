@@ -246,6 +246,57 @@ fn background_quality_writes_progress_json_and_finalises() {
 }
 
 #[test]
+fn checkpoint_cleared_on_successful_ingest() {
+    let f = Fixture::new("ckpt-clear");
+    f.write_corpus();
+    f.run(&[
+        "init",
+        "--source", f.source.to_str().unwrap(),
+        "--mode", "hybrid",
+        "--kb", f.kb.to_str().unwrap(),
+        "--ingest",
+    ]);
+    let path = f.kb.join(".ingest-state.json");
+    assert!(!path.exists(), "checkpoint must be cleared on success");
+}
+
+#[test]
+fn checkpoint_resume_skips_walk_when_phase_is_code_index() {
+    // Drop a synthetic checkpoint at phase=code_index, then run
+    // `ingest`. Plugin must skip the walk and still complete
+    // cleanly (engine's content-hash gate makes the code-graph
+    // pass a no-op).
+    let f = Fixture::new("ckpt-resume");
+    f.write_corpus();
+
+    f.run(&[
+        "init",
+        "--source", f.source.to_str().unwrap(),
+        "--mode", "hybrid",
+        "--kb", f.kb.to_str().unwrap(),
+        "--ingest",
+    ]);
+    let ckpt = f.kb.join(".ingest-state.json");
+    let body = format!(
+        r#"{{"source_root":"{}","started_at_secs":1,"phase":"code_index"}}"#,
+        f.source.display(),
+    );
+    std::fs::write(&ckpt, body).unwrap();
+
+    let out = f.run(&[
+        "ingest",
+        "--source", f.source.to_str().unwrap(),
+    ]);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        stderr.contains("walk skipped (resume)"),
+        "expected 'walk skipped (resume)' in stderr, got:\n{stderr}"
+    );
+    // Resume cleared the checkpoint on completion.
+    assert!(!ckpt.exists(), "checkpoint must be cleared after a successful resume");
+}
+
+#[test]
 fn force_reparse_does_not_grow_symbols() {
     // `--force` re-parses every file.  Engine's
     // delete-by-file_id path inside code_index keeps symbol
