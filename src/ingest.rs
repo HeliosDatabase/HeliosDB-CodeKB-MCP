@@ -31,6 +31,27 @@ use heliosdb_nano::graph_rag::{ChunkStrategy, IngestDocsOptions, IngestStats as 
 use heliosdb_nano::{EmbeddedDatabase, Value};
 use ignore::WalkBuilder;
 
+// Engine dep always has `code-embed` enabled (see Cargo.toml), so the
+// in-process FastEmbedder is unconditionally available here.
+use heliosdb_nano::code_graph::embed::FastEmbedder;
+
+/// Construct an in-process FastEmbedder and drive the engine's
+/// `code_index_with_embedder` directly, bypassing the
+/// HttpEmbedder-only construction path inside `db.code_index(opts)`.
+/// Lazily initialises the model on first call (~30 MB cache to
+/// `$XDG_CACHE_HOME/.fastembed_cache` once).
+fn run_code_index_with_inproc_embedder(
+    db: &EmbeddedDatabase,
+    opts: CodeIndexOptions,
+) -> heliosdb_nano::Result<CodeIndexStats> {
+    let embedder = FastEmbedder::try_default()?;
+    heliosdb_nano::code_graph::storage::code_index_with_embedder(
+        db,
+        opts,
+        Box::new(embedder),
+    )
+}
+
 /// Open an `EmbeddedDatabase` configured for the bulk-ingest workload.
 ///
 /// Defaults to **Async WAL fsync** (`WalSyncModeConfig::Async`) — for
@@ -104,6 +125,14 @@ pub struct IngestOptions {
     /// `WalSyncModeConfig::Async` for 10–100× throughput, accepting
     /// that a crash mid-ingest may corrupt the regenerable index.
     pub durable_writes: bool,
+    /// When true, populate `body_vec` on `_hdb_code_symbols` using
+    /// the in-process FastEmbedder (BGE-Small-EN-V1.5, 384-dim).
+    /// Lifts `helios_graphrag_search` quality for paraphrase-style
+    /// queries. Adds engine-side embedding cost during the write
+    /// phase; today (post-batched-drain) the budget probably fits
+    /// but the bench result is the source of truth — see
+    /// ROADMAP.md Tier 0.
+    pub with_embeddings: bool,
 }
 
 #[derive(Debug, Default)]
@@ -192,14 +221,15 @@ pub fn ingest(db: &EmbeddedDatabase, opts: IngestOptions) -> Result<IngestSummar
     if summary.code_upserts > 0 {
         eprintln!(
             "ingest phase: walk done in {:.1} s ({} files upserted) — \
-             starting code-graph indexer (parse + symbol extract + write to _hdb_code_*)",
+             starting code-graph indexer (parse + symbol extract + write to _hdb_code_*){}",
             started.elapsed().as_secs_f64(),
-            summary.code_upserts
+            summary.code_upserts,
+            if opts.with_embeddings { " + body embeddings" } else { "" }
         );
         let code_started = Instant::now();
         let cio = CodeIndexOptions {
             source_table: SOURCE_TABLE.to_string(),
-            embed_bodies: false, // first cut — embeddings are a separate phase
+            embed_bodies: opts.with_embeddings,
             embed_endpoint: None,
             embed_bearer: None,
             force_reparse: opts.force_reparse,
@@ -208,7 +238,14 @@ pub fn ingest(db: &EmbeddedDatabase, opts: IngestOptions) -> Result<IngestSummar
             parallelism: None,
             chunk_size: None,
         };
-        match db.code_index(cio) {
+        let result = if opts.with_embeddings {
+            run_code_index_with_inproc_embedder(db, cio)
+        } else {
+            db.code_index(cio)
+        };
+        // Note: the original code reached here as `match db.code_index(cio) {`.
+        // Bridging to keep the rest of the body unchanged below.
+        match result.map_err(anyhow::Error::from) {
             Ok(s) => {
                 summary.code = Some(s);
                 eprintln!(
