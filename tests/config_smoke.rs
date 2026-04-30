@@ -8,20 +8,21 @@
 use std::fs;
 use std::path::PathBuf;
 
+// `#[path]` imports must live at the test crate's root so the
+// `crate::kb` reference inside `config.rs` resolves — putting them
+// inside a test fn makes them sibling modules of that fn instead of
+// the crate root, breaking `crate::kb::*` lookups.
+#[path = "../src/kb.rs"]
+mod kb;
+#[path = "../src/config.rs"]
+mod config;
+
 #[test]
 fn config_toml_round_trip_in_temp_xdg_home() {
     let tmp = tempfile::tempdir().unwrap();
     // Force directories::ProjectDirs to land inside the tempdir.
     std::env::set_var("XDG_CONFIG_HOME", tmp.path().join("config"));
     std::env::set_var("XDG_DATA_HOME", tmp.path().join("data"));
-
-    // Lift the impls into scope by referencing the binary crate.
-    // We re-export the modules from main.rs through `#[path = "..."]`
-    // so this test file can use them directly.
-    #[path = "../src/config.rs"]
-    mod config;
-    #[path = "../src/kb.rs"]
-    mod kb;
 
     let mut cfg = config::Config::default();
     let source = tmp.path().join("repo");
@@ -51,11 +52,6 @@ fn longest_prefix_lookup_for_hybrid() {
     let tmp = tempfile::tempdir().unwrap();
     std::env::set_var("XDG_CONFIG_HOME", tmp.path().join("config"));
     std::env::set_var("XDG_DATA_HOME", tmp.path().join("data"));
-
-    #[path = "../src/config.rs"]
-    mod config;
-    #[path = "../src/kb.rs"]
-    mod kb;
 
     let parent = tmp.path().join("Helios");
     let child = parent.join("Nano");
