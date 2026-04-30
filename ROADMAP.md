@@ -24,7 +24,7 @@ item in one place.  Tier 0 = "next on the bench"; Tier 5 =
 | 3 | **Plugin ingest contract tests** | M | Today's `tests/config_smoke.rs` covers config only. End-to-end ingest tests would catch regressions across plugin ↔ engine version transitions. |
 | 4 | **`.gitattributes linguist-generated` honour** — *closed by `<commit>`*. `<root>/.gitattributes` and `<root>/.git/info/attributes` parsed for `linguist-generated[=true|=set]` glob patterns, matched against relative paths in the walk loop, alongside the existing `@generated` 4-KiB content-marker check. | S | GitHub-Linguist polish.  Long tail of generated files. |
 | 5 | **Resume-on-interrupt for cold ingest** | M-L | Killing a cold ingest mid-flight loses all work today.  Needs a checkpoint state machine. Adoption blocker for very large repos. |
-| 6 | **HTTP transport option in the plugin** | M | Engine already exposes `/mcp` HTTP / WS / SSE.  Plugin spawns stdio only. Adding HTTP unlocks Cursor and other clients. |
+| 6 | **HTTP transport option in the plugin** — *closed by `<commit>`*. `serve --source X --http <addr>` binds the engine's `mcp_router` (POST `/`, GET `/ws`, GET `/sse`, GET `/info`). Stdio remains the default. Graceful shutdown on Ctrl-C. | M | Engine already exposes `/mcp` HTTP / WS / SSE.  Plugin spawns stdio only. Adding HTTP unlocks Cursor and other clients. |
 
 ## Tier 2 — engine-side, owned by the HeliosDB-Nano team
 

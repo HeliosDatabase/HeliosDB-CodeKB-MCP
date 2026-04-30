@@ -50,12 +50,24 @@ struct Cli {
 
 #[derive(Subcommand)]
 enum Commands {
-    /// Run the stdio MCP loop for the KB associated with `--source`.
+    /// Run the MCP server for the KB associated with `--source`.
+    /// Default transport is stdio (the `.mcp.json` Claude Code path);
+    /// pass `--http <addr>` to bind an HTTP/WebSocket/SSE endpoint
+    /// instead — useful for Cursor and other clients that don't
+    /// speak stdio.
     Serve {
         /// Absolute path of the source root the agent is working in.
         /// Used to look up the KB in the user-level config.
         #[arg(long)]
         source: PathBuf,
+
+        /// Bind an HTTP MCP server on `<addr>` instead of running
+        /// stdio. Routes mounted: POST `/` (JSON-RPC), GET `/ws`
+        /// (WebSocket upgrade), GET `/sse` (server-sent events),
+        /// GET `/info` (one-shot discovery + cache stats).
+        /// Examples: `127.0.0.1:8765`, `0.0.0.0:8765`, `[::1]:8765`.
+        #[arg(long, value_name = "ADDR")]
+        http: Option<String>,
     },
 
     /// Create / configure a KB for a source path. Persists the choice
@@ -195,7 +207,7 @@ async fn main() -> Result<()> {
     let cli = Cli::parse();
 
     match cli.command {
-        Commands::Serve { source } => serve(&source).await,
+        Commands::Serve { source, http } => serve(&source, http.as_deref()).await,
         Commands::Init {
             source,
             mode,
@@ -265,7 +277,7 @@ async fn main() -> Result<()> {
     }
 }
 
-async fn serve(source: &std::path::Path) -> Result<()> {
+async fn serve(source: &std::path::Path, http: Option<&str>) -> Result<()> {
     let cfg = Config::load_or_default()?;
     let spec = cfg
         .lookup_for_source(source)
@@ -280,12 +292,48 @@ async fn serve(source: &std::path::Path) -> Result<()> {
         format!("failed to open EmbeddedDatabase at {}", spec.kb_dir.display())
     })?);
 
-    tracing::info!("starting MCP stdio server");
-    let mut server = heliosdb_nano::mcp::McpServer::new(db);
-    server
-        .run()
-        .await
-        .map_err(|e| anyhow::anyhow!("MCP server failed: {e}"))
+    match http {
+        None => {
+            tracing::info!("starting MCP stdio server");
+            let mut server = heliosdb_nano::mcp::McpServer::new(db);
+            server
+                .run()
+                .await
+                .map_err(|e| anyhow::anyhow!("MCP server failed: {e}"))
+        }
+        Some(addr) => {
+            // Bind axum's MCP router on the requested address.  The
+            // engine's `mcp_router` carries every transport variant
+            // (POST `/`, GET `/ws`, GET `/sse`, GET `/info`) on a
+            // single `Router<()>`, so we just hand it a fresh
+            // `McpState` and call `axum::serve`.
+            let state = heliosdb_nano::mcp::McpState::new(db);
+            let app = heliosdb_nano::mcp::mcp_router(state);
+            let listener = tokio::net::TcpListener::bind(addr)
+                .await
+                .with_context(|| format!("bind MCP HTTP listener on {addr}"))?;
+            let bound = listener
+                .local_addr()
+                .map(|a| a.to_string())
+                .unwrap_or_else(|_| addr.to_string());
+            eprintln!("MCP HTTP server listening on http://{bound}");
+            eprintln!("  POST /         JSON-RPC 2.0");
+            eprintln!("  GET  /ws       WebSocket upgrade");
+            eprintln!("  GET  /sse      server-sent events");
+            eprintln!("  GET  /info     discovery + cache stats");
+            tracing::info!(%bound, "starting MCP HTTP server");
+            // Graceful shutdown on Ctrl-C / SIGTERM so a kill from
+            // the agent harness doesn't strand RocksDB locks.
+            let shutdown = async {
+                let _ = tokio::signal::ctrl_c().await;
+                tracing::info!("MCP HTTP server received Ctrl-C, shutting down");
+            };
+            axum::serve(listener, app)
+                .with_graceful_shutdown(shutdown)
+                .await
+                .map_err(|e| anyhow::anyhow!("MCP HTTP server failed: {e}"))
+        }
+    }
 }
 
 fn init(source: &std::path::Path, mode: KbMode, kb_override: Option<&std::path::Path>) -> Result<()> {
