@@ -12,7 +12,6 @@ permissions:
 
 env:
   CARGO_TERM_COLOR: always
-  HELIOS_NANO_REPO: Dimensigon/HDB-HeliosDB-Nano
 
 jobs:
   build:
@@ -42,12 +41,6 @@ jobs:
 
     steps:
       - uses: actions/checkout@v4
-        with:
-          path: heliosdb-codekb-mcp
-      - uses: actions/checkout@v4
-        with:
-          repository: ${{ env.HELIOS_NANO_REPO }}
-          path: Nano
 
       - uses: dtolnay/rust-toolchain@stable
         with:
@@ -55,7 +48,6 @@ jobs:
 
       - uses: Swatinem/rust-cache@v2
         with:
-          workspaces: heliosdb-codekb-mcp
           key: ${{ matrix.target }}
 
       # `cross` for foreign-arch Linux; native cargo for everything else.
@@ -64,7 +56,6 @@ jobs:
         run: cargo install cross --locked
 
       - name: Build
-        working-directory: heliosdb-codekb-mcp
         env:
           CARGO_BUILD_TARGET: ${{ matrix.target }}
         run: |
@@ -75,14 +66,14 @@ jobs:
           fi
 
       - name: Strip binary (Unix only — keeps the artefact small)
-        working-directory: heliosdb-codekb-mcp/target/${{ matrix.target }}/release
+        working-directory: target/${{ matrix.target }}/release
         run: |
           if [ -f heliosdb-codekb-mcp ]; then
             strip heliosdb-codekb-mcp || true
           fi
 
       - name: Compute sha256
-        working-directory: heliosdb-codekb-mcp/target/${{ matrix.target }}/release
+        working-directory: target/${{ matrix.target }}/release
         run: |
           if command -v sha256sum >/dev/null; then
             sha256sum heliosdb-codekb-mcp > heliosdb-codekb-mcp.sha256
@@ -91,7 +82,7 @@ jobs:
           fi
 
       - name: Package
-        working-directory: heliosdb-codekb-mcp/target/${{ matrix.target }}/release
+        working-directory: target/${{ matrix.target }}/release
         run: |
           mkdir -p ../../../release
           cp heliosdb-codekb-mcp ../../../release/${{ matrix.artifact }}
@@ -100,7 +91,7 @@ jobs:
       - uses: actions/upload-artifact@v4
         with:
           name: ${{ matrix.artifact }}
-          path: heliosdb-codekb-mcp/release/
+          path: release/
 
   publish:
     name: gh release
