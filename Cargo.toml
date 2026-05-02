@@ -67,6 +67,17 @@ globset = "0.4"
 [target.'cfg(unix)'.dependencies]
 libc = "0.2"
 
+# Force vendored OpenSSL on Linux so cross-compilation (e.g. the
+# release.yml `aarch64-unknown-linux-gnu` matrix entry, run via
+# `cross`) doesn't need an arch-specific `libssl-dev:arm64` to be
+# installed inside the cross container.  Cargo's feature unification
+# pulls this `vendored` flag through to the transitive `openssl-sys`
+# brought in by `reqwest` from the engine.  macOS uses Security
+# framework (no openssl-sys), Windows uses schannel — neither
+# affected.
+[target.'cfg(target_os = "linux")'.dependencies]
+openssl-sys = { version = "0.9", features = ["vendored"] }
+
 # Native ingestion tier (no Docling). Pure Rust, no system deps.
 # Each is `optional` so building with --no-default-features omits
 # them entirely.
