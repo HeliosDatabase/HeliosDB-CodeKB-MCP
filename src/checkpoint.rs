@@ -59,10 +59,10 @@ pub fn read(kb_dir: &Path) -> Result<Option<IngestCheckpoint>> {
     if !path.exists() {
         return Ok(None);
     }
-    let body = std::fs::read_to_string(&path)
-        .with_context(|| format!("read {}", path.display()))?;
-    let cp: IngestCheckpoint = serde_json::from_str(&body)
-        .with_context(|| format!("parse {}", path.display()))?;
+    let body =
+        std::fs::read_to_string(&path).with_context(|| format!("read {}", path.display()))?;
+    let cp: IngestCheckpoint =
+        serde_json::from_str(&body).with_context(|| format!("parse {}", path.display()))?;
     Ok(Some(cp))
 }
 
@@ -74,8 +74,7 @@ pub fn write(kb_dir: &Path, source_root: &str, phase: Phase, started_at_secs: u6
     };
     let path = checkpoint_path(kb_dir);
     let json = serde_json::to_string_pretty(&cp).context("serialise checkpoint")?;
-    std::fs::write(&path, json)
-        .with_context(|| format!("write {}", path.display()))
+    std::fs::write(&path, json).with_context(|| format!("write {}", path.display()))
 }
 
 /// Mark phase started fresh (no prior run) — sets `started_at_secs`
@@ -99,8 +98,7 @@ pub fn advance(kb_dir: &Path, source_root: &str, phase: Phase) -> Result<()> {
 pub fn clear(kb_dir: &Path) -> Result<()> {
     let path = checkpoint_path(kb_dir);
     if path.exists() {
-        std::fs::remove_file(&path)
-            .with_context(|| format!("remove {}", path.display()))?;
+        std::fs::remove_file(&path).with_context(|| format!("remove {}", path.display()))?;
     }
     Ok(())
 }

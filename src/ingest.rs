@@ -46,11 +46,7 @@ fn run_code_index_with_inproc_embedder(
     opts: CodeIndexOptions,
 ) -> heliosdb_nano::Result<CodeIndexStats> {
     let embedder = FastEmbedder::try_default()?;
-    heliosdb_nano::code_graph::storage::code_index_with_embedder(
-        db,
-        opts,
-        Box::new(embedder),
-    )
+    heliosdb_nano::code_graph::storage::code_index_with_embedder(db, opts, Box::new(embedder))
 }
 
 /// Open an `EmbeddedDatabase` configured for the bulk-ingest workload.
@@ -93,20 +89,27 @@ const PROGRESS_EVERY_FILES: u64 = 250;
 /// virtualenvs, IDE caches.  Gate-keeps "files seen: 3268" for trees
 /// where the actual code tree is ~10 files.
 const SKIP_DIRS: &[&str] = &[
-    "target",        // Rust / Cargo
-    "node_modules",  // JS / TS
-    "dist",          // generic + Python sdist
-    "build",         // CMake / generic
-    "out",           // generic
-    ".venv", "venv", // Python virtualenvs
-    "__pycache__",   // Python bytecode
-    ".next", ".nuxt",// Next / Nuxt
-    ".cache",        // tooling caches
-    "vendor",        // Go / Ruby
-    "Pods",          // CocoaPods (iOS)
-    ".gradle", ".mvn", // JVM
-    ".idea", ".vscode", // IDE state (not code)
-    ".pytest_cache", ".mypy_cache", ".ruff_cache", ".tox",
+    "target",       // Rust / Cargo
+    "node_modules", // JS / TS
+    "dist",         // generic + Python sdist
+    "build",        // CMake / generic
+    "out",          // generic
+    ".venv",
+    "venv",        // Python virtualenvs
+    "__pycache__", // Python bytecode
+    ".next",
+    ".nuxt",  // Next / Nuxt
+    ".cache", // tooling caches
+    "vendor", // Go / Ruby
+    "Pods",   // CocoaPods (iOS)
+    ".gradle",
+    ".mvn", // JVM
+    ".idea",
+    ".vscode", // IDE state (not code)
+    ".pytest_cache",
+    ".mypy_cache",
+    ".ruff_cache",
+    ".tox",
 ];
 
 #[derive(Debug, Clone)]
@@ -144,7 +147,7 @@ pub struct IngestOptions {
     /// ~26 s on the pilot corpus instead of ~3 m 15 s. Progress is
     /// surfaced via `status --source X`. Recommended for repos with
     /// >~1 k files where a blocking embedding pass is awkward. See
-    /// `crate::quality` for the progress-file contract.
+    /// > `crate::quality` for the progress-file contract.
     pub background_quality: bool,
 }
 
@@ -197,11 +200,11 @@ fn classify(path: &Path) -> Class<'static> {
         "ipynb" => Class::Notebook,
         // Schema/IDL files: registered grammars cover graphql; the rest
         // fall back to text retrieval.
-        "graphql" | "gql" => Class::Text,    // schema text — searchable
-        "proto" | "thrift" => Class::Text,   // IDL — searchable
+        "graphql" | "gql" => Class::Text, // schema text — searchable
+        "proto" | "thrift" => Class::Text, // IDL — searchable
         // Text class — flat retrieval via graph_rag_ingest_docs.
-        "txt" | "rst" | "tex" | "org" | "log"
-        | "toml" | "yaml" | "yml" | "json" | "ini" | "cfg" => Class::Text,
+        "txt" | "rst" | "tex" | "org" | "log" | "toml" | "yaml" | "yml" | "json" | "ini"
+        | "cfg" => Class::Text,
         "pdf" => Class::Pdf,
         "docx" => Class::Docx,
         "xlsx" | "xlsm" => Class::Xlsx,
@@ -249,8 +252,7 @@ pub fn ingest(db: &EmbeddedDatabase, opts: IngestOptions) -> Result<IngestSummar
         // idempotently anyway, but skipping saves the wall time.
         let skip_walk = matches!(
             resume_from,
-            Some(crate::checkpoint::Phase::CodeIndex)
-                | Some(crate::checkpoint::Phase::GraphRag)
+            Some(crate::checkpoint::Phase::CodeIndex) | Some(crate::checkpoint::Phase::GraphRag)
         );
 
         if skip_walk {
@@ -283,7 +285,9 @@ pub fn ingest(db: &EmbeddedDatabase, opts: IngestOptions) -> Result<IngestSummar
             // Mark walk in-flight before touching disk so a kill
             // during the walk leaves a checkpoint to resume from.
             crate::checkpoint::begin(
-                &opts.kb_dir, &source_root_str, crate::checkpoint::Phase::Walk,
+                &opts.kb_dir,
+                &source_root_str,
+                crate::checkpoint::Phase::Walk,
             )?;
             // Bulk-upsert path: one transaction around the whole
             // walk so the engine pays durability overhead once
@@ -328,14 +332,15 @@ pub fn ingest(db: &EmbeddedDatabase, opts: IngestOptions) -> Result<IngestSummar
         );
     }
 
-
     // Step 2: run the code-graph indexer over the `src` table.
     if summary.code_upserts > 0 {
         // Advance the resume checkpoint — we're about to enter the
         // expensive parse/write phase.
         if !is_quality_child {
             crate::checkpoint::advance(
-                &opts.kb_dir, &source_root_str, crate::checkpoint::Phase::CodeIndex,
+                &opts.kb_dir,
+                &source_root_str,
+                crate::checkpoint::Phase::CodeIndex,
             )?;
         }
         eprintln!(
@@ -343,7 +348,11 @@ pub fn ingest(db: &EmbeddedDatabase, opts: IngestOptions) -> Result<IngestSummar
              starting code-graph indexer (parse + symbol extract + write to _hdb_code_*){}",
             started.elapsed().as_secs_f64(),
             summary.code_upserts,
-            if opts.with_embeddings { " + body embeddings" } else { "" }
+            if opts.with_embeddings {
+                " + body embeddings"
+            } else {
+                ""
+            }
         );
         let code_started = Instant::now();
         let cio = CodeIndexOptions {
@@ -380,7 +389,9 @@ pub fn ingest(db: &EmbeddedDatabase, opts: IngestOptions) -> Result<IngestSummar
     if summary.doc_upserts + summary.binary_upserts > 0 {
         if !is_quality_child {
             crate::checkpoint::advance(
-                &opts.kb_dir, &source_root_str, crate::checkpoint::Phase::GraphRag,
+                &opts.kb_dir,
+                &source_root_str,
+                crate::checkpoint::Phase::GraphRag,
             )?;
         }
         eprintln!(
@@ -426,9 +437,9 @@ fn walk_and_upsert(
     summary: &mut IngestSummary,
 ) -> Result<()> {
     let walker = WalkBuilder::new(&opts.source_root)
-        .hidden(true)        // skip dot-files / dot-dirs (incl. .git, .helios-kb)
-        .git_ignore(true)    // honour .gitignore
-        .git_global(true)    // honour ~/.config/git/ignore
+        .hidden(true) // skip dot-files / dot-dirs (incl. .git, .helios-kb)
+        .git_ignore(true) // honour .gitignore
+        .git_global(true) // honour ~/.config/git/ignore
         .git_exclude(true)
         .filter_entry(|entry| {
             // ripgrep parity: skip well-known build / vendor dirs even
@@ -485,8 +496,10 @@ fn walk_and_upsert(
         // Skip anything inside the KB itself (defence in depth — gitignore
         // should have caught it, but the user might run ingest before
         // saving .gitignore).
-        if path.components().any(|c| c.as_os_str() == ".helios-kb"
-                                    || c.as_os_str() == ".helios-index") {
+        if path
+            .components()
+            .any(|c| c.as_os_str() == ".helios-kb" || c.as_os_str() == ".helios-index")
+        {
             continue;
         }
 
@@ -597,7 +610,10 @@ struct TxnGuard<'a> {
 impl<'a> TxnGuard<'a> {
     fn begin(db: &'a EmbeddedDatabase) -> Result<Self> {
         db.execute("BEGIN").context("BEGIN transaction")?;
-        Ok(Self { db, finished: false })
+        Ok(Self {
+            db,
+            finished: false,
+        })
     }
     fn commit(mut self) -> Result<()> {
         self.db.execute("COMMIT").context("COMMIT transaction")?;
@@ -605,7 +621,9 @@ impl<'a> TxnGuard<'a> {
         Ok(())
     }
     fn rollback(mut self) -> Result<()> {
-        self.db.execute("ROLLBACK").context("ROLLBACK transaction")?;
+        self.db
+            .execute("ROLLBACK")
+            .context("ROLLBACK transaction")?;
         self.finished = true;
         Ok(())
     }
@@ -728,7 +746,7 @@ fn is_generated_file(path: &Path) -> bool {
     head.contains("@generated")
         || head.contains("DO NOT EDIT")
         || head.contains("AUTO-GENERATED")
-        || head.contains("Code generated by")  // Go convention
+        || head.contains("Code generated by") // Go convention
 }
 
 fn record_read_error(summary: &mut IngestSummary, path: &Path, reason: &str) {
@@ -908,7 +926,10 @@ mod tests {
         assert!(matches!(classify(Path::new("a.rs")), Class::Code("rust")));
         assert!(matches!(classify(Path::new("a.py")), Class::Code("python")));
         assert!(matches!(classify(Path::new("a.tsx")), Class::Code("tsx")));
-        assert!(matches!(classify(Path::new("a.md")), Class::Code("markdown")));
+        assert!(matches!(
+            classify(Path::new("a.md")),
+            Class::Code("markdown")
+        ));
         assert!(matches!(classify(Path::new("a.txt")), Class::Text));
         assert!(matches!(classify(Path::new("a.pdf")), Class::Pdf));
         assert!(matches!(classify(Path::new("a.docx")), Class::Docx));

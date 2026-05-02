@@ -233,9 +233,7 @@ async fn main() -> Result<()> {
             let mode = KbMode::parse(&mode)?;
             init(&source, mode, kb.as_deref())?;
             if ingest {
-                let canonical_source = source
-                    .canonicalize()
-                    .unwrap_or_else(|_| source.clone());
+                let canonical_source = source.canonicalize().unwrap_or_else(|_| source.clone());
                 let kb_dir = lookup_kb_dir(&canonical_source)?;
                 let opts = IngestOptions {
                     source_root: canonical_source,
@@ -306,7 +304,10 @@ async fn serve(source: &std::path::Path, http: Option<&str>) -> Result<()> {
 
     tracing::info!(kb = %spec.kb_dir.display(), "opening KB");
     let db = Arc::new(EmbeddedDatabase::new(&spec.kb_dir).with_context(|| {
-        format!("failed to open EmbeddedDatabase at {}", spec.kb_dir.display())
+        format!(
+            "failed to open EmbeddedDatabase at {}",
+            spec.kb_dir.display()
+        )
     })?);
 
     match http {
@@ -353,15 +354,21 @@ async fn serve(source: &std::path::Path, http: Option<&str>) -> Result<()> {
     }
 }
 
-fn init(source: &std::path::Path, mode: KbMode, kb_override: Option<&std::path::Path>) -> Result<()> {
+fn init(
+    source: &std::path::Path,
+    mode: KbMode,
+    kb_override: Option<&std::path::Path>,
+) -> Result<()> {
     let source = source.canonicalize().with_context(|| {
-        format!("source path `{}` must exist and be canonicalisable", source.display())
+        format!(
+            "source path `{}` must exist and be canonicalisable",
+            source.display()
+        )
     })?;
     let spec = KbSpec::resolve(&source, mode, kb_override)?;
 
-    std::fs::create_dir_all(&spec.kb_dir).with_context(|| {
-        format!("failed to create KB directory {}", spec.kb_dir.display())
-    })?;
+    std::fs::create_dir_all(&spec.kb_dir)
+        .with_context(|| format!("failed to create KB directory {}", spec.kb_dir.display()))?;
 
     if mode == KbMode::CoLocated {
         ensure_gitignore_entry(&source, ".helios-kb/")?;
@@ -411,7 +418,12 @@ fn status(source: Option<&std::path::Path>, mcp_url: Option<&str>) -> Result<()>
         println!("default-mode : {}", cfg.default_mode.as_str());
         println!("registered KBs ({}):", cfg.kbs.len());
         for (src, spec) in &cfg.kbs {
-            println!("  {}  →  {}  ({})", src, spec.kb_dir.display(), spec.mode.as_str());
+            println!(
+                "  {}  →  {}  ({})",
+                src,
+                spec.kb_dir.display(),
+                spec.mode.as_str()
+            );
         }
     }
     Ok(())
@@ -454,10 +466,16 @@ fn print_mcp_cache_stats(url: &str) {
     };
     let size = cache.get("size").and_then(|v| v.as_u64()).unwrap_or(0);
     let cap = cache.get("capacity").and_then(|v| v.as_u64()).unwrap_or(0);
-    let gen_n = cache.get("generation").and_then(|v| v.as_u64()).unwrap_or(0);
+    let gen_n = cache
+        .get("generation")
+        .and_then(|v| v.as_u64())
+        .unwrap_or(0);
     let hits = cache.get("hits").and_then(|v| v.as_u64()).unwrap_or(0);
     let misses = cache.get("misses").and_then(|v| v.as_u64()).unwrap_or(0);
-    let hit_rate = cache.get("hit_rate").and_then(|v| v.as_f64()).unwrap_or(0.0);
+    let hit_rate = cache
+        .get("hit_rate")
+        .and_then(|v| v.as_f64())
+        .unwrap_or(0.0);
     println!(
         "mcp cache : {size} / {cap} entries, {:.1}% hit rate ({hits} hit / {misses} miss), gen {gen_n}",
         hit_rate * 100.0,
@@ -514,7 +532,10 @@ fn print_quality_phase(kb_dir: &std::path::Path) {
                     "quality phase : stale — pid {} not running and no completion recorded",
                     p.pid
                 );
-                println!("              : tail {} or re-run `ingest --background-quality`", p.log_path);
+                println!(
+                    "              : tail {} or re-run `ingest --background-quality`",
+                    p.log_path
+                );
             }
             println!("              : log → {}", p.log_path);
         }
@@ -598,7 +619,11 @@ fn run_and_print_ingest(opts: &IngestOptions) -> Result<()> {
     eprintln!("  kb            : {}", spec.kb_dir.display());
     eprintln!(
         "  wal sync      : {}",
-        if opts.durable_writes { "Sync (durable)" } else { "Async (fast)" }
+        if opts.durable_writes {
+            "Sync (durable)"
+        } else {
+            "Async (fast)"
+        }
     );
     eprintln!("  files seen    : {}", summary.files_seen);
     eprintln!(
@@ -634,10 +659,7 @@ fn run_and_print_ingest(opts: &IngestOptions) -> Result<()> {
         // Lets operators see speedup directly instead of stopwatching.
         eprintln!(
             "  code_index ms : parse={} write={} workers={} chunks={}",
-            c.parse_elapsed_ms,
-            c.write_elapsed_ms,
-            c.parse_workers,
-            c.chunks_processed
+            c.parse_elapsed_ms, c.write_elapsed_ms, c.parse_workers, c.chunks_processed
         );
     }
     if let Some(d) = summary.docs {
@@ -685,7 +707,8 @@ fn spawn_quality_child(
     let exe = std::env::current_exe().context("locate current_exe")?;
     let mut cmd = std::process::Command::new(&exe);
     cmd.arg("ingest")
-        .arg("--source").arg(source_root)
+        .arg("--source")
+        .arg(source_root)
         .arg("--with-embeddings")
         .arg("--force");
     if durable_writes {
@@ -733,7 +756,10 @@ fn spawn_quality_child(
     eprintln!("  progress  : {}", progress_path.display());
     eprintln!();
     eprintln!("Track via:");
-    eprintln!("  heliosdb-codekb-mcp status --source {}", source_root.display());
+    eprintln!(
+        "  heliosdb-codekb-mcp status --source {}",
+        source_root.display()
+    );
     eprintln!();
     eprintln!("MCP queries can already use the index (BM25 + hop-distance);");
     eprintln!("paraphrase quality lifts once the embedding pass finishes.");
@@ -746,7 +772,10 @@ fn spawn_quality_child(
 fn ensure_gitignore_entry(repo_root: &std::path::Path, entry: &str) -> Result<()> {
     let path = repo_root.join(".gitignore");
     let body = std::fs::read_to_string(&path).unwrap_or_default();
-    if body.lines().any(|l| l.trim() == entry.trim_end_matches('/') || l.trim() == entry) {
+    if body
+        .lines()
+        .any(|l| l.trim() == entry.trim_end_matches('/') || l.trim() == entry)
+    {
         return Ok(());
     }
     let mut new = body;
@@ -755,7 +784,6 @@ fn ensure_gitignore_entry(repo_root: &std::path::Path, entry: &str) -> Result<()
     }
     new.push_str(entry);
     new.push('\n');
-    std::fs::write(&path, new)
-        .with_context(|| format!("failed to update {}", path.display()))?;
+    std::fs::write(&path, new).with_context(|| format!("failed to update {}", path.display()))?;
     Ok(())
 }

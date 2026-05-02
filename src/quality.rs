@@ -50,20 +50,17 @@ pub fn log_path(kb_dir: &Path) -> PathBuf {
 }
 
 pub fn write(path: &Path, p: &QualityProgress) -> Result<()> {
-    let json = serde_json::to_string_pretty(p)
-        .context("serialise QualityProgress")?;
-    std::fs::write(path, json)
-        .with_context(|| format!("write {}", path.display()))
+    let json = serde_json::to_string_pretty(p).context("serialise QualityProgress")?;
+    std::fs::write(path, json).with_context(|| format!("write {}", path.display()))
 }
 
 pub fn read(path: &Path) -> Result<Option<QualityProgress>> {
     if !path.exists() {
         return Ok(None);
     }
-    let body = std::fs::read_to_string(path)
-        .with_context(|| format!("read {}", path.display()))?;
-    let p: QualityProgress = serde_json::from_str(&body)
-        .with_context(|| format!("parse {}", path.display()))?;
+    let body = std::fs::read_to_string(path).with_context(|| format!("read {}", path.display()))?;
+    let p: QualityProgress =
+        serde_json::from_str(&body).with_context(|| format!("parse {}", path.display()))?;
     Ok(Some(p))
 }
 

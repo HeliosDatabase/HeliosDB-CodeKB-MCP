@@ -74,15 +74,21 @@ impl ServerFixture {
             .env("XDG_DATA_HOME", &xdg_data)
             .args([
                 "init",
-                "--source", source.to_str().unwrap(),
-                "--mode", "hybrid",
-                "--kb", kb.to_str().unwrap(),
+                "--source",
+                source.to_str().unwrap(),
+                "--mode",
+                "hybrid",
+                "--kb",
+                kb.to_str().unwrap(),
                 "--ingest",
             ])
             .output()
             .expect("init");
-        assert!(init.status.success(), "init failed: {}",
-            String::from_utf8_lossy(&init.stderr));
+        assert!(
+            init.status.success(),
+            "init failed: {}",
+            String::from_utf8_lossy(&init.stderr)
+        );
 
         let port = pick_port();
         let log_path = td.path().join("serve.log");
@@ -94,8 +100,10 @@ impl ServerFixture {
             .env("XDG_DATA_HOME", &xdg_data)
             .args([
                 "serve",
-                "--source", source.to_str().unwrap(),
-                "--http", &format!("127.0.0.1:{port}"),
+                "--source",
+                source.to_str().unwrap(),
+                "--http",
+                &format!("127.0.0.1:{port}"),
             ])
             .stdin(Stdio::null())
             .stdout(log)
@@ -104,7 +112,12 @@ impl ServerFixture {
             .expect("spawn serve");
 
         wait_for_port("127.0.0.1", port, Duration::from_secs(15));
-        Self { _td: td, child, port, log_path }
+        Self {
+            _td: td,
+            child,
+            port,
+            log_path,
+        }
     }
 
     fn url(&self, path: &str) -> String {
@@ -141,14 +154,23 @@ fn get_info_returns_cache_and_tools() {
         .into_json()
         .expect("parse JSON");
 
-    assert_eq!(info["serverInfo"]["name"], "heliosdb-nano",
-        "unexpected serverInfo: {info}");
+    assert_eq!(
+        info["serverInfo"]["name"], "heliosdb-nano",
+        "unexpected serverInfo: {info}"
+    );
     let tools = info["tools"].as_array().expect("tools array");
     assert!(!tools.is_empty(), "tool list must be non-empty");
     let cache = &info["cache"];
     assert!(cache.is_object(), "expected cache field on /info");
-    for key in ["size", "capacity", "generation", "hits",
-                "misses", "evictions", "hit_rate"] {
+    for key in [
+        "size",
+        "capacity",
+        "generation",
+        "hits",
+        "misses",
+        "evictions",
+        "hit_rate",
+    ] {
         assert!(
             cache.get(key).is_some(),
             "cache.{key} missing — got {cache}"
@@ -185,7 +207,10 @@ fn post_root_runs_jsonrpc() {
         .into_json()
         .expect("parse JSON");
     let cache = &resp["result"]["cache"];
-    assert!(cache.is_object(), "JSON-RPC helios/info missing cache field");
+    assert!(
+        cache.is_object(),
+        "JSON-RPC helios/info missing cache field"
+    );
 }
 
 #[test]

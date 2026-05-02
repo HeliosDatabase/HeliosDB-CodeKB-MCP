@@ -47,7 +47,13 @@ impl Fixture {
         std::fs::create_dir_all(&kb).unwrap();
         std::fs::create_dir_all(&xdg_config).unwrap();
         std::fs::create_dir_all(&xdg_data).unwrap();
-        Self { _td: td, source, kb, xdg_config, xdg_data }
+        Self {
+            _td: td,
+            source,
+            kb,
+            xdg_config,
+            xdg_data,
+        }
     }
 
     fn write_corpus(&self) {
@@ -55,13 +61,15 @@ impl Fixture {
             self.source.join("a.rs"),
             "pub fn add(a: i32, b: i32) -> i32 { a + b }\n\
              pub fn sub(a: i32, b: i32) -> i32 { a - b }\n",
-        ).unwrap();
+        )
+        .unwrap();
         std::fs::create_dir_all(self.source.join("sub")).unwrap();
         std::fs::write(
             self.source.join("sub/b.py"),
             "def hello():\n    return 'hi'\n\
              def goodbye():\n    return 'bye'\n",
-        ).unwrap();
+        )
+        .unwrap();
     }
 
     fn cmd(&self) -> Command {
@@ -105,17 +113,25 @@ fn init_then_ingest_produces_expected_row_counts() {
 
     f.run(&[
         "init",
-        "--source", f.source.to_str().unwrap(),
-        "--mode", "hybrid",
-        "--kb", f.kb.to_str().unwrap(),
+        "--source",
+        f.source.to_str().unwrap(),
+        "--mode",
+        "hybrid",
+        "--kb",
+        f.kb.to_str().unwrap(),
         "--ingest",
     ]);
 
     let db = EmbeddedDatabase::new(&f.kb).unwrap();
-    assert_eq!(count(&db, "SELECT count(*) FROM src"), 2,
-        "src should hold one row per source file");
-    assert!(count(&db, "SELECT count(*) FROM _hdb_code_symbols") >= 4,
-        "expect at least 4 symbols (2 fns × 2 files)");
+    assert_eq!(
+        count(&db, "SELECT count(*) FROM src"),
+        2,
+        "src should hold one row per source file"
+    );
+    assert!(
+        count(&db, "SELECT count(*) FROM _hdb_code_symbols") >= 4,
+        "expect at least 4 symbols (2 fns × 2 files)"
+    );
     // Default fast tier: no embeddings.  Engine's
     // `ensure_body_vec_column` only ALTERs `_hdb_code_symbols` to
     // add `body_vec` lazily when an embedder runs; in fast tier the
@@ -156,19 +172,22 @@ fn second_ingest_does_not_duplicate_rows() {
 
     f.run(&[
         "init",
-        "--source", f.source.to_str().unwrap(),
-        "--mode", "hybrid",
-        "--kb", f.kb.to_str().unwrap(),
+        "--source",
+        f.source.to_str().unwrap(),
+        "--mode",
+        "hybrid",
+        "--kb",
+        f.kb.to_str().unwrap(),
         "--ingest",
     ]);
-    f.run(&[
-        "ingest",
-        "--source", f.source.to_str().unwrap(),
-    ]);
+    f.run(&["ingest", "--source", f.source.to_str().unwrap()]);
 
     let db = EmbeddedDatabase::new(&f.kb).unwrap();
-    assert_eq!(count(&db, "SELECT count(*) FROM src"), 2,
-        "second ingest must not duplicate src rows (FR cross_process_on_conflict)");
+    assert_eq!(
+        count(&db, "SELECT count(*) FROM src"),
+        2,
+        "second ingest must not duplicate src rows (FR cross_process_on_conflict)"
+    );
 }
 
 #[test]
@@ -181,18 +200,26 @@ fn with_embeddings_populates_body_vec() {
 
     f.run(&[
         "init",
-        "--source", f.source.to_str().unwrap(),
-        "--mode", "hybrid",
-        "--kb", f.kb.to_str().unwrap(),
+        "--source",
+        f.source.to_str().unwrap(),
+        "--mode",
+        "hybrid",
+        "--kb",
+        f.kb.to_str().unwrap(),
         "--ingest",
         "--with-embeddings",
     ]);
 
     let db = EmbeddedDatabase::new(&f.kb).unwrap();
     let symbols = count(&db, "SELECT count(*) FROM _hdb_code_symbols");
-    let with_vec = count(&db, "SELECT count(*) FROM _hdb_code_symbols WHERE body_vec IS NOT NULL");
-    assert_eq!(with_vec, symbols,
-        "every symbol must have body_vec populated under --with-embeddings");
+    let with_vec = count(
+        &db,
+        "SELECT count(*) FROM _hdb_code_symbols WHERE body_vec IS NOT NULL",
+    );
+    assert_eq!(
+        with_vec, symbols,
+        "every symbol must have body_vec populated under --with-embeddings"
+    );
 }
 
 #[test]
@@ -206,16 +233,22 @@ fn background_quality_writes_progress_json_and_finalises() {
 
     f.run(&[
         "init",
-        "--source", f.source.to_str().unwrap(),
-        "--mode", "hybrid",
-        "--kb", f.kb.to_str().unwrap(),
+        "--source",
+        f.source.to_str().unwrap(),
+        "--mode",
+        "hybrid",
+        "--kb",
+        f.kb.to_str().unwrap(),
         "--ingest",
         "--background-quality",
     ]);
 
     let progress_path = f.kb.join("quality-progress.json");
-    assert!(progress_path.exists(),
-        "expected {} after --background-quality", progress_path.display());
+    assert!(
+        progress_path.exists(),
+        "expected {} after --background-quality",
+        progress_path.display()
+    );
 
     // Wait up to 30 s for the child to finalise (small corpus +
     // cached FastEmbedder normally finishes in a couple of seconds;
@@ -224,25 +257,37 @@ fn background_quality_writes_progress_json_and_finalises() {
     let mut completed = false;
     while std::time::Instant::now() < deadline {
         let body = std::fs::read_to_string(&progress_path).expect("read progress");
-        if body.contains("\"completed_at_secs\":") && !body.contains("\"completed_at_secs\": null") {
+        if body.contains("\"completed_at_secs\":") && !body.contains("\"completed_at_secs\": null")
+        {
             completed = true;
             break;
         }
         std::thread::sleep(std::time::Duration::from_millis(500));
     }
-    assert!(completed, "background quality child did not finalise within 30 s");
+    assert!(
+        completed,
+        "background quality child did not finalise within 30 s"
+    );
 
     // Child should have populated body_vec.
     let db = EmbeddedDatabase::new(&f.kb).unwrap();
     let symbols = count(&db, "SELECT count(*) FROM _hdb_code_symbols");
-    let with_vec = count(&db, "SELECT count(*) FROM _hdb_code_symbols WHERE body_vec IS NOT NULL");
-    assert_eq!(with_vec, symbols,
-        "body_vec must be populated after background quality completes");
+    let with_vec = count(
+        &db,
+        "SELECT count(*) FROM _hdb_code_symbols WHERE body_vec IS NOT NULL",
+    );
+    assert_eq!(
+        with_vec, symbols,
+        "body_vec must be populated after background quality completes"
+    );
     // src must not have grown (FR cross_process_on_conflict — no
     // duplication even though the child opens the KB in a fresh
     // process and the workaround skip is now perf-only).
-    assert_eq!(count(&db, "SELECT count(*) FROM src"), 2,
-        "src must not grow when child re-opens the KB");
+    assert_eq!(
+        count(&db, "SELECT count(*) FROM src"),
+        2,
+        "src must not grow when child re-opens the KB"
+    );
 }
 
 #[test]
@@ -251,9 +296,12 @@ fn checkpoint_cleared_on_successful_ingest() {
     f.write_corpus();
     f.run(&[
         "init",
-        "--source", f.source.to_str().unwrap(),
-        "--mode", "hybrid",
-        "--kb", f.kb.to_str().unwrap(),
+        "--source",
+        f.source.to_str().unwrap(),
+        "--mode",
+        "hybrid",
+        "--kb",
+        f.kb.to_str().unwrap(),
         "--ingest",
     ]);
     let path = f.kb.join(".ingest-state.json");
@@ -271,9 +319,12 @@ fn checkpoint_resume_skips_walk_when_phase_is_code_index() {
 
     f.run(&[
         "init",
-        "--source", f.source.to_str().unwrap(),
-        "--mode", "hybrid",
-        "--kb", f.kb.to_str().unwrap(),
+        "--source",
+        f.source.to_str().unwrap(),
+        "--mode",
+        "hybrid",
+        "--kb",
+        f.kb.to_str().unwrap(),
         "--ingest",
     ]);
     let ckpt = f.kb.join(".ingest-state.json");
@@ -283,17 +334,17 @@ fn checkpoint_resume_skips_walk_when_phase_is_code_index() {
     );
     std::fs::write(&ckpt, body).unwrap();
 
-    let out = f.run(&[
-        "ingest",
-        "--source", f.source.to_str().unwrap(),
-    ]);
+    let out = f.run(&["ingest", "--source", f.source.to_str().unwrap()]);
     let stderr = String::from_utf8_lossy(&out.stderr);
     assert!(
         stderr.contains("walk skipped (resume)"),
         "expected 'walk skipped (resume)' in stderr, got:\n{stderr}"
     );
     // Resume cleared the checkpoint on completion.
-    assert!(!ckpt.exists(), "checkpoint must be cleared after a successful resume");
+    assert!(
+        !ckpt.exists(),
+        "checkpoint must be cleared after a successful resume"
+    );
 }
 
 #[test]
@@ -306,22 +357,23 @@ fn force_reparse_does_not_grow_symbols() {
 
     f.run(&[
         "init",
-        "--source", f.source.to_str().unwrap(),
-        "--mode", "hybrid",
-        "--kb", f.kb.to_str().unwrap(),
+        "--source",
+        f.source.to_str().unwrap(),
+        "--mode",
+        "hybrid",
+        "--kb",
+        f.kb.to_str().unwrap(),
         "--ingest",
     ]);
     let db = EmbeddedDatabase::new(&f.kb).unwrap();
     let baseline = count(&db, "SELECT count(*) FROM _hdb_code_symbols");
     drop(db);
 
-    f.run(&[
-        "ingest",
-        "--source", f.source.to_str().unwrap(),
-        "--force",
-    ]);
+    f.run(&["ingest", "--source", f.source.to_str().unwrap(), "--force"]);
     let db = EmbeddedDatabase::new(&f.kb).unwrap();
     let after_force = count(&db, "SELECT count(*) FROM _hdb_code_symbols");
-    assert_eq!(after_force, baseline,
-        "force-reparse must not duplicate symbols (delete-by-file_id stable)");
+    assert_eq!(
+        after_force, baseline,
+        "force-reparse must not duplicate symbols (delete-by-file_id stable)"
+    );
 }
