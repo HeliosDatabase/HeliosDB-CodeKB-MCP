@@ -2,14 +2,14 @@
 //!
 //! Three modes:
 //!
-//! * `co-located`  — KB at `<source>/.helios-kb`. The init flow adds
-//!                   `.helios-kb/` to `<source>/.gitignore`.
-//! * `global`      — KB at `${XDG_DATA_HOME:-~/.local/share}/helios-kb/<slug>`
-//!                   where `<slug>` is a path-encoded form of the
-//!                   absolute source path.
-//! * `hybrid`      — KB at an explicit path the user provides via
-//!                   `--kb`; multiple sources can share the same
-//!                   directory by registering each via `init`.
+//! * `co-located` — KB at `<source>/.helios-kb`. The init flow adds
+//!   `.helios-kb/` to `<source>/.gitignore`.
+//! * `global` — KB at `${XDG_DATA_HOME:-~/.local/share}/helios-kb/<slug>`
+//!   where `<slug>` is a path-encoded form of the absolute source
+//!   path.
+//! * `hybrid` — KB at an explicit path the user provides via `--kb`;
+//!   multiple sources can share the same directory by registering
+//!   each via `init`.
 
 use std::path::{Path, PathBuf};
 
@@ -55,7 +55,9 @@ impl KbSpec {
         let kb_dir = match (mode, kb_override) {
             (KbMode::CoLocated, None) => source.join(".helios-kb"),
             (KbMode::CoLocated, Some(_)) => {
-                bail!("--kb is not used with --mode co-located; the KB lives at <source>/.helios-kb")
+                bail!(
+                    "--kb is not used with --mode co-located; the KB lives at <source>/.helios-kb"
+                )
             }
             (KbMode::Global, None) => global_default_kb_dir(source)?,
             (KbMode::Global, Some(p)) => p.to_path_buf(),

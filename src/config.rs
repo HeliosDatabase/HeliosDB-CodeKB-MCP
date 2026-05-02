@@ -153,7 +153,20 @@ fn epoch_to_ymdhms(mut s: u64) -> (i32, u32, u32, u32, u32, u32) {
         year += 1;
     }
     let leap = (year % 4 == 0 && year % 100 != 0) || (year % 400 == 0);
-    let months = [31, if leap { 29 } else { 28 }, 31, 30, 31, 30, 31, 31, 30, 31, 30, 31];
+    let months = [
+        31,
+        if leap { 29 } else { 28 },
+        31,
+        30,
+        31,
+        30,
+        31,
+        31,
+        30,
+        31,
+        30,
+        31,
+    ];
     let mut mo = 1u32;
     for &dim in &months {
         if days < dim {

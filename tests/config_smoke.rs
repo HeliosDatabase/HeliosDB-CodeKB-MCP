@@ -13,10 +13,10 @@ use std::sync::Mutex;
 // `crate::kb` reference inside `config.rs` resolves — putting them
 // inside a test fn makes them sibling modules of that fn instead of
 // the crate root, breaking `crate::kb::*` lookups.
-#[path = "../src/kb.rs"]
-mod kb;
 #[path = "../src/config.rs"]
 mod config;
+#[path = "../src/kb.rs"]
+mod kb;
 
 // Both tests below mutate process-global env vars (`XDG_CONFIG_HOME`
 // / `XDG_DATA_HOME`).  Cargo runs tests in parallel by default, so
@@ -46,11 +46,19 @@ fn config_toml_round_trip_in_temp_xdg_home() {
     cfg.save().unwrap();
 
     let path = config::Config::path().unwrap();
-    assert!(path.exists(), "expected config to land at {}", path.display());
+    assert!(
+        path.exists(),
+        "expected config to land at {}",
+        path.display()
+    );
 
     let loaded = config::Config::load_or_default().unwrap();
     assert_eq!(loaded.kbs.len(), 1);
-    let key = source.canonicalize().unwrap().to_string_lossy().into_owned();
+    let key = source
+        .canonicalize()
+        .unwrap()
+        .to_string_lossy()
+        .into_owned();
     assert!(loaded.kbs.contains_key(&key));
     assert_eq!(loaded.kbs[&key].mode, kb::KbMode::CoLocated);
 }
