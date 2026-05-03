@@ -1,12 +1,10 @@
 # Cross-compilation configuration for aarch64-unknown-linux-gnu
-# Uses a base image with better C toolchain and clang support
-
-[build]
-# Use a more recent pre-built image with better tooling
-# The default manylinux image has an older clang; use ubuntu-based instead
-xargo = false
+# Installs C build tools needed for rocksdb compilation
 
 [target.aarch64-unknown-linux-gnu]
-# Use a newer Ubuntu-based image instead of the default manylinux one
-# to get better C headers (stdbool.h) and a modern clang version (>= 10)
-image = "ghcr.io/cross-rs/cross:aarch64-unknown-linux-gnu-latest"
+# Pre-build hook to install necessary C dev tools in the cross container
+# rocksdb/librocksdb-sys needs: standard C headers, clang/gcc, build-essential
+pre-build = [
+    "apt-get update",
+    "apt-get install -y build-essential clang",
+]
