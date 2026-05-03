@@ -7,6 +7,34 @@ LSP-shaped + GraphRAG tools to Claude Code, Cursor, Codex, Aider,
 and any other MCP-aware agent — over plain stdio JSON-RPC, no
 ports, no auth dance, all local.
 
+## Install
+
+### Pre-built binary (recommended)
+
+Latest release: **[v0.1.0](https://github.com/dimensigon/heliosdb-codekb-mcp/releases/tag/v0.1.0)**
+
+| Platform | Status |
+|----------|--------|
+| Linux x86_64 | ✅ available — download from the release page |
+| macOS x86_64 (Intel) | planned |
+| Linux / macOS aarch64 | planned (rocksdb cross-compile blocker) |
+
+```bash
+curl -L \
+  https://github.com/dimensigon/heliosdb-codekb-mcp/releases/download/v0.1.0/heliosdb-codekb-mcp-linux-x86_64 \
+  -o /usr/local/bin/heliosdb-codekb-mcp
+chmod +x /usr/local/bin/heliosdb-codekb-mcp
+```
+
+Verify with the matching `.sha256` from the release page.
+
+### From source (any platform)
+
+```bash
+cargo build --release --features native-binary-docs
+# binary: ./target/release/heliosdb-codekb-mcp
+```
+
 ## What it is
 
 Three things at once:
