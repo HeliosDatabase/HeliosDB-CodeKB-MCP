@@ -59,10 +59,18 @@ jobs:
         env:
           CARGO_BUILD_TARGET: ${{ matrix.target }}
         run: |
-          if [ "${{ matrix.cross }}" = "true" ]; then
-            cross build --release --target ${{ matrix.target }} --features native-binary-docs
+          # aarch64 builds: skip native-binary-docs (rocksdb has C build issues on aarch64)
+          # x86_64 builds: include native-binary-docs for full feature set
+          if [[ "${{ matrix.target }}" == *"aarch64"* ]]; then
+            FEATURES=""
           else
-            cargo build --release --target ${{ matrix.target }} --features native-binary-docs
+            FEATURES="--features native-binary-docs"
+          fi
+
+          if [ "${{ matrix.cross }}" = "true" ]; then
+            cross build --release --target ${{ matrix.target }} $FEATURES
+          else
+            cargo build --release --target ${{ matrix.target }} $FEATURES
           fi
 
       - name: Strip binary (Unix only — keeps the artefact small)
