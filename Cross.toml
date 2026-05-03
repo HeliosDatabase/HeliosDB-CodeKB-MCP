@@ -1,0 +1,12 @@
+# Cross-compilation configuration for aarch64-unknown-linux-gnu
+# Uses a base image with better C toolchain and clang support
+
+[build]
+# Use a more recent pre-built image with better tooling
+# The default manylinux image has an older clang; use ubuntu-based instead
+xargo = false
+
+[target.aarch64-unknown-linux-gnu]
+# Use a newer Ubuntu-based image instead of the default manylinux one
+# to get better C headers (stdbool.h) and a modern clang version (>= 10)
+image = "ghcr.io/cross-rs/cross:aarch64-unknown-linux-gnu-latest"

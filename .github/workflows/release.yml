@@ -60,9 +60,9 @@ jobs:
           CARGO_BUILD_TARGET: ${{ matrix.target }}
         run: |
           if [ "${{ matrix.cross }}" = "true" ]; then
-            cross build --release --target ${{ matrix.target }}
+            cross build --release --target ${{ matrix.target }} --features native-binary-docs
           else
-            cargo build --release --target ${{ matrix.target }}
+            cargo build --release --target ${{ matrix.target }} --features native-binary-docs
           fi
 
       - name: Strip binary (Unix only — keeps the artefact small)
