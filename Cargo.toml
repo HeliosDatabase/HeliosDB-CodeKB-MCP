@@ -31,7 +31,11 @@ native-binary-docs = ["dep:pdf-extract", "dep:docx-rs", "dep:calamine"]
 docling = []
 
 [dependencies]
-heliosdb-nano = { version = "3.22.2", features = [
+# Version requirement: any 3.x ≥ 3.22.2 (caret-style). Pinned to the
+# 3.x major because the engine's MCP/code-graph/graph-rag surface
+# is a 3.x-stable contract. Run `cargo update -p heliosdb-nano` to
+# refresh the lockfile to the latest compatible publish.
+heliosdb-nano = { version = ">=3.22.2, <4", features = [
     "code-graph",
     "graph-rag",
     "mcp-endpoint",
@@ -91,8 +95,13 @@ calamine    = { version = "0.24", optional = true }
 # default features (no TLS — loopback only).
 ureq = { version = "2", default-features = false, features = ["json"] }
 
-[dev-dependencies]
+# Used by `crate::linker` to stream multi-row INSERT batches to a
+# bounded-memory tempfile before the bulk-apply pass. Also pulled in
+# transitively by the engine for its own temp scratch, so we're not
+# adding a new build-graph cost — just promoting from dev-deps.
 tempfile = "3"
+
+[dev-dependencies]
 
 [profile.release]
 opt-level = 3

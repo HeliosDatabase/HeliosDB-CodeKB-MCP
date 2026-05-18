@@ -28,7 +28,9 @@ use anyhow::{Context, Result};
 use globset::{Glob, GlobSet, GlobSetBuilder};
 use heliosdb_nano::code_graph::{CodeIndexOptions, CodeIndexStats};
 use heliosdb_nano::config::{Config as EngineConfig, WalSyncModeConfig};
-use heliosdb_nano::graph_rag::{ChunkStrategy, IngestDocsOptions, IngestStats as DocStats};
+use heliosdb_nano::graph_rag::{
+    ChunkStrategy, IngestDocsOptions, IngestStats as DocStats, LinkerStats,
+};
 use heliosdb_nano::{EmbeddedDatabase, Value};
 use ignore::WalkBuilder;
 
@@ -72,6 +74,11 @@ pub fn open_kb_for_ingest(kb_dir: &Path, durable: bool) -> Result<EmbeddedDataba
 const MAX_FILE_BYTES: u64 = 5 * 1024 * 1024; // 5 MiB; bigger files skipped
 const SOURCE_TABLE: &str = "src";
 const DOCS_TABLE: &str = "docs";
+/// Markdown-only doc table. Split from `docs` so the second
+/// `graph_rag_ingest_docs` call can use `ChunkStrategy::Headings`
+/// (producing `DocSection` + `PART_OF` edges) without needing
+/// per-row chunk selection in the engine.
+const DOCS_MD_TABLE: &str = "docs_md";
 const MAX_ERROR_SAMPLES: usize = 10;
 /// Emit a progress line to stderr roughly every this often during the
 /// walk-and-upsert phase. Long ingests (10 k+ file repos at minutes
@@ -156,6 +163,7 @@ pub struct IngestSummary {
     pub files_seen: u64,
     pub code_upserts: u64,
     pub doc_upserts: u64,
+    pub md_doc_upserts: u64,
     pub binary_upserts: u64,
     pub skipped: u64,
     pub read_errors: u64,
@@ -165,11 +173,23 @@ pub struct IngestSummary {
     pub elapsed_ms: u128,
     pub code: Option<CodeIndexStats>,
     pub docs: Option<DocStats>,
+    /// Stats from the second `graph_rag_ingest_docs` pass over
+    /// `docs_md` with `ChunkStrategy::Headings`.
+    pub docs_md: Option<DocStats>,
+    /// Stats from the post-ingest entity linker (text→symbol
+    /// `MENTIONS` edges via `link_exact_qualified`).
+    pub links: Option<LinkerStats>,
 }
 
 #[derive(Debug)]
 enum Class<'a> {
     Code(&'a str), // engine `lang` tag — must match `Language::from_name`
+    /// Files that benefit from BOTH a code-graph parse (so headings
+    /// become navigable symbols via `helios_lsp_document_symbols`)
+    /// AND a graph-rag doc projection with heading-aware chunking
+    /// (so `helios_graphrag_search` can return the smallest matching
+    /// `DocChunk` instead of the whole file). Currently markdown.
+    CodeAndDoc(&'a str),
     Text,
     Notebook, // .ipynb — extract code cells, classify by metadata.kernelspec
     Pdf,
@@ -195,7 +215,7 @@ fn classify(path: &Path) -> Class<'static> {
         "js" | "mjs" | "cjs" => Class::Code("javascript"),
         "go" => Class::Code("go"),
         "sql" => Class::Code("sql"),
-        "md" | "markdown" => Class::Code("markdown"),
+        "md" | "markdown" => Class::CodeAndDoc("markdown"),
         // Notebook — special-cased extractor (see `extract_ipynb`).
         "ipynb" => Class::Notebook,
         // Schema/IDL files: registered grammars cover graphql; the rest
@@ -277,9 +297,18 @@ pub fn ingest(db: &EmbeddedDatabase, opts: IngestOptions) -> Result<IngestSummar
                     summary.doc_upserts = n;
                 }
             }
+            if let Ok(rows) = db.query("SELECT count(*) FROM docs_md", &[]) {
+                if let Some(n) = rows.first().and_then(|r| r.values.first()) {
+                    summary.md_doc_upserts = match n {
+                        Value::Int4(v) => *v as u64,
+                        Value::Int8(v) => *v as u64,
+                        _ => 0,
+                    };
+                }
+            }
             eprintln!(
-                "ingest phase: walk skipped (resume) — trusting existing src/docs rows ({} src, {} docs)",
-                summary.code_upserts, summary.doc_upserts,
+                "ingest phase: walk skipped (resume) — trusting existing src/docs rows ({} src, {} docs, {} docs_md)",
+                summary.code_upserts, summary.doc_upserts, summary.md_doc_upserts,
             );
         } else {
             // Mark walk in-flight before touching disk so a kill
@@ -385,8 +414,19 @@ pub fn ingest(db: &EmbeddedDatabase, opts: IngestOptions) -> Result<IngestSummar
         }
     }
 
-    // Step 3: run the graph-rag doc ingester over the `docs` table.
-    if summary.doc_upserts + summary.binary_upserts > 0 {
+    // Step 3: run the graph-rag doc ingester. Two passes:
+    //   * `docs`   — chunked one-per-row (unstructured text, configs,
+    //                PDFs, DOCX, XLSX). No structural splitter would
+    //                give better chunks here.
+    //   * `docs_md` — chunked by Markdown ATX headings. Produces
+    //                `DocSection` + `DocChunk` nodes connected by
+    //                `PART_OF` edges, so `helios_graphrag_search`
+    //                can return the smallest matching section instead
+    //                of the whole file. This is what makes the plugin
+    //                competitive with PageIndex-style doc retrieval.
+    let has_row_docs = summary.doc_upserts + summary.binary_upserts > 0;
+    let has_md_docs = summary.md_doc_upserts > 0;
+    if has_row_docs || has_md_docs {
         if !is_quality_child {
             crate::checkpoint::advance(
                 &opts.kb_dir,
@@ -395,26 +435,66 @@ pub fn ingest(db: &EmbeddedDatabase, opts: IngestOptions) -> Result<IngestSummar
             )?;
         }
         eprintln!(
-            "ingest phase: starting graph-rag doc projection ({} rows)",
-            summary.doc_upserts + summary.binary_upserts
+            "ingest phase: starting graph-rag doc projection ({} row-mode + {} heading-mode docs)",
+            summary.doc_upserts + summary.binary_upserts,
+            summary.md_doc_upserts,
         );
         let docs_started = Instant::now();
-        let opts2 = IngestDocsOptions {
-            source_table: DOCS_TABLE.to_string(),
-            id_col: "path".to_string(),
-            text_col: "content".to_string(),
-            title_col: None,
-            chunk_by: ChunkStrategy::Row,
-        };
-        match db.graph_rag_ingest_docs(&opts2) {
-            Ok(s) => {
-                summary.docs = Some(s);
-                eprintln!(
-                    "ingest phase: graph-rag done in {:.1} s",
-                    docs_started.elapsed().as_secs_f64()
-                );
+        if has_row_docs {
+            let opts2 = IngestDocsOptions {
+                source_table: DOCS_TABLE.to_string(),
+                id_col: "path".to_string(),
+                text_col: "content".to_string(),
+                title_col: None,
+                chunk_by: ChunkStrategy::Row,
+            };
+            match db.graph_rag_ingest_docs(&opts2) {
+                Ok(s) => summary.docs = Some(s),
+                Err(e) => tracing::warn!("graph_rag_ingest_docs(row) failed: {e}"),
             }
-            Err(e) => tracing::warn!("graph_rag_ingest_docs failed: {e}"),
+        }
+        if has_md_docs {
+            let opts_md = IngestDocsOptions {
+                source_table: DOCS_MD_TABLE.to_string(),
+                id_col: "path".to_string(),
+                text_col: "content".to_string(),
+                title_col: None,
+                chunk_by: ChunkStrategy::Headings,
+            };
+            match db.graph_rag_ingest_docs(&opts_md) {
+                Ok(s) => summary.docs_md = Some(s),
+                Err(e) => tracing::warn!("graph_rag_ingest_docs(headings) failed: {e}"),
+            }
+        }
+        eprintln!(
+            "ingest phase: graph-rag done in {:.1} s",
+            docs_started.elapsed().as_secs_f64()
+        );
+
+        // Step 3b: entity linker — emit `MENTIONS` edges from
+        // doc/email/issue text nodes to `_hdb_code_symbols` whose
+        // `qualified` name appears as a whole word in the text.
+        // This is what lets `helios_graphrag_search "FastEmbedder"`
+        // traverse from a README mention to the actual code symbol
+        // in one round-trip instead of two.
+        //
+        // Plugin-side bulk path (see `crate::linker`): the engine's
+        // `link_exact_qualified` was ~89 min on the pilot Nano
+        // corpus (70k edges via per-row implicit-txn INSERTs). The
+        // plugin's `link_mentions_bulk` does the same computation
+        // but streams batches to a tempfile and applies them via
+        // `execute_batch` under `SET bulk_load_mode = true`.
+        let link_started = Instant::now();
+        match crate::linker::link_mentions_bulk(db) {
+            Ok(stats) => {
+                eprintln!(
+                    "ingest phase: linker done in {:.1} s — {} MENTIONS edges added (bulk)",
+                    link_started.elapsed().as_secs_f64(),
+                    stats.mentions_added
+                );
+                summary.links = Some(stats);
+            }
+            Err(e) => tracing::warn!("link_mentions_bulk failed: {e}"),
         }
     }
 
@@ -549,6 +629,15 @@ fn walk_and_upsert(
                 }
                 Err(e) => record_read_error(summary, path, &e.to_string()),
             },
+            Class::CodeAndDoc(lang) => match read_utf8(path) {
+                Ok(content) => {
+                    upsert_src(db, &rel, &content, lang)?;
+                    summary.code_upserts += 1;
+                    upsert_doc_md(db, &rel, &content)?;
+                    summary.md_doc_upserts += 1;
+                }
+                Err(e) => record_read_error(summary, path, &e.to_string()),
+            },
             Class::Text => match read_utf8(path) {
                 Ok(content) => {
                     upsert_doc(db, &rel, &content, "text")?;
@@ -656,6 +745,14 @@ fn ensure_tables(db: &EmbeddedDatabase) -> Result<()> {
         )",
     )
     .context("create docs table")?;
+    db.execute(
+        "CREATE TABLE IF NOT EXISTS docs_md (
+            path     TEXT PRIMARY KEY,
+            content  TEXT,
+            kind     TEXT
+        )",
+    )
+    .context("create docs_md table")?;
     Ok(())
 }
 
@@ -769,6 +866,19 @@ fn upsert_src(db: &EmbeddedDatabase, path: &str, content: &str, lang: &str) -> R
         ],
     )
     .with_context(|| format!("upsert_src {path}"))?;
+    Ok(())
+}
+
+fn upsert_doc_md(db: &EmbeddedDatabase, path: &str, content: &str) -> Result<()> {
+    db.execute_params(
+        "INSERT INTO docs_md (path, content, kind) VALUES ($1, $2, 'markdown') \
+         ON CONFLICT(path) DO UPDATE SET content = excluded.content, kind = excluded.kind",
+        &[
+            Value::String(path.to_string()),
+            Value::String(content.to_string()),
+        ],
+    )
+    .with_context(|| format!("upsert_doc_md {path}"))?;
     Ok(())
 }
 
@@ -928,7 +1038,7 @@ mod tests {
         assert!(matches!(classify(Path::new("a.tsx")), Class::Code("tsx")));
         assert!(matches!(
             classify(Path::new("a.md")),
-            Class::Code("markdown")
+            Class::CodeAndDoc("markdown")
         ));
         assert!(matches!(classify(Path::new("a.txt")), Class::Text));
         assert!(matches!(classify(Path::new("a.pdf")), Class::Pdf));

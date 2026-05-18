@@ -32,6 +32,7 @@ mod checkpoint;
 mod config;
 mod ingest;
 mod kb;
+mod linker;
 mod quality;
 
 use config::Config;
@@ -627,8 +628,8 @@ fn run_and_print_ingest(opts: &IngestOptions) -> Result<()> {
     );
     eprintln!("  files seen    : {}", summary.files_seen);
     eprintln!(
-        "  upserted      : {} code, {} text, {} binary-doc",
-        summary.code_upserts, summary.doc_upserts, summary.binary_upserts
+        "  upserted      : {} code, {} text, {} markdown, {} binary-doc",
+        summary.code_upserts, summary.doc_upserts, summary.md_doc_upserts, summary.binary_upserts
     );
     eprintln!(
         "  skipped       : {}  read errors: {}",
@@ -664,8 +665,20 @@ fn run_and_print_ingest(opts: &IngestOptions) -> Result<()> {
     }
     if let Some(d) = summary.docs {
         eprintln!(
-            "  graph_rag     : nodes={} edges={} rows_seen={} rows_skipped={}",
+            "  graph_rag row : nodes={} edges={} rows_seen={} rows_skipped={}",
             d.nodes_added, d.edges_added, d.rows_seen, d.rows_skipped
+        );
+    }
+    if let Some(d) = summary.docs_md {
+        eprintln!(
+            "  graph_rag md  : nodes={} edges={} rows_seen={} rows_skipped={}  (heading-chunked DocSection + PART_OF)",
+            d.nodes_added, d.edges_added, d.rows_seen, d.rows_skipped
+        );
+    }
+    if let Some(l) = summary.links {
+        eprintln!(
+            "  linker        : nodes_scanned={} mentions_added={} candidates={}",
+            l.nodes_scanned, l.mentions_added, l.candidates_seen
         );
     }
 

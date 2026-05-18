@@ -72,6 +72,24 @@ impl Fixture {
         .unwrap();
     }
 
+    /// Corpus that also includes a Markdown file with multiple ATX
+    /// headings — exercises the `docs_md` table + `ChunkStrategy::
+    /// Headings` projection. The README references `add` so the
+    /// entity linker can emit a `MENTIONS` edge into the code symbol.
+    fn write_corpus_with_md(&self) {
+        self.write_corpus();
+        std::fs::write(
+            self.source.join("README.md"),
+            "# Project\n\n\
+             Top-level overview.\n\n\
+             ## Math helpers\n\n\
+             The `add` function adds two integers and returns the sum.\n\n\
+             ## Greetings\n\n\
+             `hello` returns a friendly string.\n",
+        )
+        .unwrap();
+    }
+
     fn cmd(&self) -> Command {
         let mut c = Command::new(binary());
         c.env("XDG_CONFIG_HOME", &self.xdg_config);
@@ -375,5 +393,90 @@ fn force_reparse_does_not_grow_symbols() {
     assert_eq!(
         after_force, baseline,
         "force-reparse must not duplicate symbols (delete-by-file_id stable)"
+    );
+}
+
+#[test]
+fn markdown_uses_heading_chunking_and_links_to_code() {
+    // The retrieval-quality contract that makes the plugin
+    // competitive with PageIndex (for doc navigation) and tree-sitter
+    // alone (for code navigation):
+    //
+    //   1. `.md` files land in `docs_md` and are projected via
+    //      `ChunkStrategy::Headings`, producing `DocSection` and
+    //      `DocChunk` graph nodes connected by `PART_OF` edges.
+    //   2. The entity linker emits `MENTIONS` edges from doc text
+    //      nodes to `_hdb_code_symbols` whose `qualified` name
+    //      appears verbatim in the body — so the README's reference
+    //      to `add` traverses straight into the Rust function.
+    //
+    // See ROADMAP.md "Retrieval-quality audit (2026-05-18)" items A + B.
+    let f = Fixture::new("md-headings-linker");
+    f.write_corpus_with_md();
+
+    f.run(&[
+        "init",
+        "--source",
+        f.source.to_str().unwrap(),
+        "--mode",
+        "hybrid",
+        "--kb",
+        f.kb.to_str().unwrap(),
+        "--ingest",
+    ]);
+
+    let db = EmbeddedDatabase::new(&f.kb).unwrap();
+
+    // docs_md table populated.
+    assert_eq!(
+        count(&db, "SELECT count(*) FROM docs_md"),
+        1,
+        "docs_md should hold the README.md row"
+    );
+    assert_eq!(
+        count(&db, "SELECT count(*) FROM docs"),
+        0,
+        "row-mode docs table should be empty when corpus has only markdown",
+    );
+
+    // Heading projection: at least one DocSection (for `# Project`,
+    // `## Math helpers`, `## Greetings`) and at least one DocChunk
+    // (per-heading body). Exact counts depend on the engine's
+    // splitter; assert ≥1 to stay robust to splitter tweaks.
+    let sections = count(
+        &db,
+        "SELECT count(*) FROM _hdb_graph_nodes WHERE node_kind = 'DocSection'",
+    );
+    assert!(
+        sections >= 1,
+        "expected at least one DocSection node, got {sections}"
+    );
+    let chunks = count(
+        &db,
+        "SELECT count(*) FROM _hdb_graph_nodes WHERE node_kind = 'DocChunk'",
+    );
+    assert!(
+        chunks >= 1,
+        "expected at least one DocChunk node, got {chunks}"
+    );
+    let part_of = count(
+        &db,
+        "SELECT count(*) FROM _hdb_graph_edges WHERE edge_kind = 'PART_OF'",
+    );
+    assert!(
+        part_of >= 1,
+        "expected at least one PART_OF edge (DocChunk → DocSection), got {part_of}"
+    );
+
+    // Entity linker: README mentions `add`, which is a Rust symbol in
+    // `a.rs`. The exact-qualified linker should emit at least one
+    // MENTIONS edge.
+    let mentions = count(
+        &db,
+        "SELECT count(*) FROM _hdb_graph_edges WHERE edge_kind = 'MENTIONS'",
+    );
+    assert!(
+        mentions >= 1,
+        "expected at least one MENTIONS edge from README to code symbol, got {mentions}"
     );
 }
