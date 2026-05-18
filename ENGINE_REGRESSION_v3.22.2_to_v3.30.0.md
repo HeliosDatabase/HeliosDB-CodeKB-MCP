@@ -1,5 +1,18 @@
 # Engine regression: `code_index` write-phase slowdown between heliosdb-nano v3.22.2 → v3.30.0
 
+> **Update 2026-05-19 — bisect localised the regression.** A separate Claude
+> session bisected inside `[3.22.3 … 3.30.0]` in 3 builds (~31 min wall):
+> regression first appears in **v3.28.0** (`20169f4` — KanttBan Bug #6 FK
+> enforcement on INSERT/UPDATE), not v3.30.0 as guessed below. The 3.30.0
+> Quirk H fix was the symptom-locator: it added an ART-index fast path but
+> explicitly preserved the slow scan-and-merge fallback for the in-txn
+> case the plugin always hits via `TxnGuard`. Root-cause analysis,
+> trace, and recommended engine fix shapes (in-txn ART with write-set
+> overlay; defer-to-COMMIT; or `code_index` hot-path bypass) are in
+> [`ENGINE_REGRESSION_BISECT_RESULT.md`](./ENGINE_REGRESSION_BISECT_RESULT.md).
+> The suspect ranking below is preserved as the original analysis but is
+> superseded by the bisect.
+
 **Status:** confirmed on `/home/gpc/HDB/Nano` corpus, 2026-05-18.
 **Severity:** ~338× slowdown on the write phase; total ingest 45 s → ~93 min.
 **Where:** `heliosdb-nano` write path exercised by `EmbeddedDatabase::code_index(...)`. Not in plugin code — the plugin was identical for both runs (modulo the dep pin).
