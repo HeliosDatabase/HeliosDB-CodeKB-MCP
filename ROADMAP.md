@@ -48,6 +48,39 @@ item in one place.  Tier 0 = "next on the bench"; Tier 5 =
 | 17 | Marketplace listing (Anthropic-curated and / or community) | distribution |
 | 18 | Plugin's launcher auto-fetch path (currently a stub) becomes live | plugin (auto-activates once #16 ships) |
 
+## Retrieval-quality audit (2026-05-18)
+
+Goal: make this plugin **the best token-saving MCP for agentic search**
+across code + docs. Beat tree-sitter alone (which only sees code) and
+beat PageIndex (which only navigates doc TOCs) by composing engine
+features both already cover, into one KB.
+
+Findings, ranked by expected token-savings lift on the pilot corpus:
+
+| # | Gap                                                                            | Engine support today                                | Status      |
+|---|--------------------------------------------------------------------------------|-----------------------------------------------------|-------------|
+| A | All docs ingested as `ChunkStrategy::Row` — no `DocSection` / `PART_OF` nodes   | `ChunkStrategy::Headings` (engine `graph_rag/ingest.rs`) | **closed (this PR)** — `.md`/`.markdown` now dual-routed: code-graph headings + `DocSection`/`DocChunk` projection for `helios_graphrag_search` to navigate by section instead of returning whole docs |
+| B | No text→symbol entity links — agents can't follow a README mention into code    | `link_exact_qualified` (engine `graph_rag/linker.rs`) | **closed (this PR)** — post-ingest phase emits `MENTIONS` edges from `DocChunk` text to `_hdb_code_symbols.qualified`. Uses a plugin-side bulk implementation (`src/linker.rs`) — streams `(from, to)` tuples to a tempfile as multi-row `INSERT … VALUES (…)` batches, then applies via `execute_batch` under `SET bulk_load_mode = true`. The engine's `link_exact_qualified` was ~89 min on the pilot Nano corpus (70k edges via per-row implicit-txn INSERTs); the bulk path targets a 50–100× speedup |
+| C | No centrality-based rerank on `helios_graphrag_search`                         | `centrality_rerank` (engine `graph_rag/centrality.rs`) | engine-side wiring needed — search currently ranks by hop-distance only |
+| D | Doc outline is one level deep (`level > 0` flattens `#`/`##`/`###`)            | `split_markdown_headings` flat                       | engine FR — nested `DocSection` parents → true tree, PageIndex-grade navigation |
+| E | `WITH CONTEXT (…)` SQL clause reachable only via `heliosdb_query`              | `graph_rag_expand_with_context` exists; no dedicated MCP tool wrapper | engine-side — file a request for `helios_graphrag_with_context` |
+| F | `ingest_email` / `ingest_issues` / `ingest_qa` adapters not exposed            | engine adapters present                              | deferred — out of v1 scope (would unlock "agentic search across project comms") |
+| G | `heliosdb_branch_*` + `heliosdb_time_travel` MCP tools unused in the docs/UX   | already exposed via `mcp-endpoint`                   | docs-only — agent workflow note to be added to README |
+| H | `.proto` / `.thrift` / `.graphql` / `.java` / `.cpp` fall to text retrieval     | engine grammars not registered                       | engine FR — extend `code-graph` grammar list |
+
+### Why this matters for token saving
+
+Without (A): a 2000-line architecture doc returns as one `DocChunk` —
+the agent pays for the entire blob just to find the section it
+needed. With (A): the agent gets the smallest matching `DocChunk`
+and can walk `PART_OF` to neighbours only when needed.
+
+Without (B): the agent must run two queries — one against
+`_hdb_graph_nodes` (docs) and one against `_hdb_code_symbols` (code) —
+and reconcile them client-side, burning context and tool budget.
+With (B): one `helios_graphrag_search` traverses both halves through
+the `MENTIONS` edge.
+
 ## Tier 4 — future direction, post-v1.0
 
 | # | Item | Notes |
