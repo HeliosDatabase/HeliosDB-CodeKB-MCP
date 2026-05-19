@@ -35,6 +35,26 @@ cargo build --release --features native-binary-docs
 # binary: ./target/release/heliosdb-codekb-mcp
 ```
 
+## Use as a Claude Code plugin
+
+This repo ships a `.claude-plugin/plugin.json` manifest plus three slash
+commands (`/codekb-setup`, `/codekb-ingest`, `/codekb-status`) and a
+`codekb-pro-features` skill. Install for a single Claude Code session:
+
+```bash
+claude --plugin-dir /abs/path/to/heliosdb-codekb-mcp
+```
+
+Or fetch directly from a release/branch URL once distributed via a
+plugin marketplace. On first use, run `/codekb-setup` — it walks you
+through the binary install (if needed), asks whether to enable the
+optional one-time ~30 MB embeddings download, and indexes the current
+project.
+
+The plugin's `.mcp.json` declares the MCP server with
+`--source ${CLAUDE_PROJECT_DIR}`, so the helios MCP tools follow
+whichever project Claude Code is opened in.
+
 ## What it is
 
 Three things at once:
