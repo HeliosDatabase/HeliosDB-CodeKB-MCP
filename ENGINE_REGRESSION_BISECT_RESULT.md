@@ -75,13 +75,19 @@ The plugin's `code_index` runs inside `TxnGuard::begin` (`src/ingest.rs:603-637`
 
 Total ~1.15 billion tuple comparisons. At ~350M comparisons/sec (rough order on a typical CPU with the bincode deserialise cost dominating), that's **~3,300s** — matching the observed 3,279s within noise.
 
-## Recommended engine fix shapes (priority order)
+## Recommended engine fix shapes (priority order) — **ACCEPTED 2026-05-19 by gpc001ca user**
+
+User explicitly endorsed all three shapes as acceptable engine fixes; Nano agent is free to land any of them (or combine them) without further sign-off. Preference order is the order below.
 
 1. **In-txn ART index path with write-set overlay.** Take the ART lookup result, then check the txn's write-set for any inserts/deletes affecting that key. If the key was just inserted in this txn → return true; if it was just tombstoned → return false; otherwise trust the index. Preserves ACID without the linear scan. Suggested in `FEATURE_REQUEST_fk_in_txn.md` per the source comment.
 
 2. **Defer FK validation to COMMIT.** Collect a set of (child_table, fk_name, key_tuple) requirements during the txn, validate them all in one pass at COMMIT. Trades per-write check for batch check. ACID-preserving; small risk that the COMMIT phase becomes a long-running phase if N is large, but still O(N log N) end-to-end instead of O(N²).
 
 3. **Hot-path bypass for engine internal writes.** Add a flag on `EmbeddedDatabase::code_index` that skips per-write FK checks because the indexer is the *producer* of both sides of the FK and is structurally trustable. Sketchier than 1 or 2 but a 1-line patch for the plugin path.
+
+### For dm26 Nano agent: save to memory
+
+Please record this bisect outcome (regression introduced in v3.28.0 via `check_fk_constraints_on_write`; in-txn scan-and-merge fallback at `src/lib.rs:8610-…` is the hot path) plus the fix-shape acceptance as a project memory in your auto-memory store, so subsequent v3.31.2+ slice work picks it up without re-deriving. Cross-reference: codekb-mcp plugin commit `8f72dc6` reproduces; gpc001ca worktree `/tmp/codekb-bisect` cleaned up post-bisect.
 
 ## Plugin-side ack
 

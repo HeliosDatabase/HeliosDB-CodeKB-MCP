@@ -12,6 +12,27 @@
 > [`ENGINE_REGRESSION_BISECT_RESULT.md`](./ENGINE_REGRESSION_BISECT_RESULT.md).
 > The suspect ranking below is preserved as the original analysis but is
 > superseded by the bisect.
+>
+> **Update 2026-05-19 (later) — design doc accepted, engine implementation
+> in flight.** Engine-team Claude drafted a 453-line proposal at
+> `Dimensigon/HDB-HeliosDB-Nano:PROPOSAL_FK_VALIDATION_OPTIMIZATION.md`
+> covering ten solution shapes drawn from PG / MySQL / Oracle / SQL:202x
+> prior art plus a HeliosProxy fk-cache WASM plugin, and a four-tier
+> roadmap. All four tiers accepted by the engine team:
+>
+> - **T1** — In-txn ART index path with write-set overlay (~700× speedup
+>   on our path; closes this regression). **Plugin needs no change.**
+> - **T2** — `SET helios.fk_validation = enforced | deferred | audit | off`
+>   session GUC. *We may opt in for `code_index` ingest once available
+>   since the engine is the structurally-trusted producer of both FK
+>   sides.*
+> - **T3** — `CONSTRAINT … NOT ENFORCED` per-FK (SQL:202x surface).
+> - **T4** — HeliosProxy fk-cache WASM plugin (out-of-engine validation).
+>
+> Tracked engine-side as PRs on `Dimensigon/HDB-HeliosDB-Nano` +
+> `Dimensigon/HDB-HeliosDB-Proxy-Plugins`. Plugin stays pinned at
+> `>=3.22.2, <4`; consume the fix transparently via `cargo update -p
+> heliosdb-nano` once T1 ships. No plugin work blocked.
 
 **Status:** confirmed on `/home/gpc/HDB/Nano` corpus, 2026-05-18.
 **Severity:** ~338× slowdown on the write phase; total ingest 45 s → ~93 min.
