@@ -81,6 +81,23 @@ and reconcile them client-side, burning context and tool budget.
 With (B): one `helios_graphrag_search` traverses both halves through
 the `MENTIONS` edge.
 
+### Open engine dependencies (tracked, not blocking plugin work)
+
+- **FK validation regression v3.28.0** — `code_index` ingest of the Nano
+  engine itself goes from ~45 s (v3.22.2) to ~93 min (v3.28.0+) because
+  per-write FK validation falls back to a linear scan inside any
+  transaction (the plugin runs `code_index` inside a `TxnGuard`).
+  Bisect + root cause: [`ENGINE_REGRESSION_BISECT_RESULT.md`](./ENGINE_REGRESSION_BISECT_RESULT.md).
+  Engine-team design doc accepted at
+  `Dimensigon/HDB-HeliosDB-Nano:PROPOSAL_FK_VALIDATION_OPTIMIZATION.md`;
+  four-tier roadmap (T1 in-txn ART overlay, T2 session GUC, T3 NOT
+  ENFORCED, T4 HeliosProxy fk-cache plugin). **T1 closes the regression
+  with no plugin change.** Plugin stays on `>=3.22.2, <4` and absorbs
+  the fix via `cargo update -p heliosdb-nano` once T1 ships.
+  Once T2 ships we may opt in to `SET helios.fk_validation = off` for
+  the `code_index` window since the engine is the structurally-trusted
+  producer of both FK sides.
+
 ## Tier 4 — future direction, post-v1.0
 
 | # | Item | Notes |
