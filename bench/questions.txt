@@ -1,0 +1,14 @@
+# Bench questions — one per line, ignoring blank lines and lines starting with #.
+# Mix of: code-discovery, doc-retrieval, cross-modal (code↔doc), comparative.
+# Edit freely.
+
+Where in the storage layer is foreign-key validation performed on an INSERT?
+What does the WASM plugin architecture do, per the project's documentation?
+Find the function that handles WAL flushing — what's its signature?
+Does this codebase support time-travel queries? If yes, where is the API entry point?
+How does the engine handle multi-tenancy? Point to the relevant module and explain in 2-3 sentences.
+What's the default WAL sync mode and where is it set?
+In the docs, what does HIGH_AVAILABILITY_OVERVIEW.md cover?
+What's the difference between the heliosdb-cache and heliosdb-storage crates?
+Where is the HNSW index implementation and how are inserts maintained?
+List the public types exposed by the heliosdb-vector crate's main module.
