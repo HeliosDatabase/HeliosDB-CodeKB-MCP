@@ -141,7 +141,7 @@ pub fn link_mentions_bulk(db: &EmbeddedDatabase) -> Result<LinkerStats> {
     );
 
     let mut row_buf: Vec<(i64, i64)> = Vec::with_capacity(VALUES_PER_STATEMENT);
-    let mut flush_statement = |buf: &mut Vec<(i64, i64)>, w: &mut BufWriter<std::fs::File>| -> Result<()> {
+    let flush_statement = |buf: &mut Vec<(i64, i64)>, w: &mut BufWriter<std::fs::File>| -> Result<()> {
         if buf.is_empty() {
             return Ok(());
         }
@@ -275,8 +275,15 @@ fn as_string(v: Option<&Value>) -> Option<String> {
 
 /// Whole-word match: `needle` must not be flanked by identifier chars
 /// on either side. Mirrors `heliosdb_nano::graph_rag::linker::
-/// contains_whole_word`.
+/// contains_whole_word`, with one bug fix: advance `start` past the
+/// matched needle rather than by one byte, since `+1` can land
+/// inside a multi-byte UTF-8 sequence and panic the next slice
+/// (real-world repro: doc text containing an emoji adjacent to text
+/// scanned for symbol matches).
 fn contains_whole_word(haystack: &str, needle: &str) -> bool {
+    if needle.is_empty() {
+        return false;
+    }
     let mut start = 0usize;
     while let Some(pos) = haystack[start..].find(needle) {
         let abs = start + pos;
@@ -288,7 +295,15 @@ fn contains_whole_word(haystack: &str, needle: &str) -> bool {
         if before_ok && after_ok {
             return true;
         }
-        start = abs + 1;
+        // Skip past the matched needle. `abs + needle.len()` is
+        // guaranteed to be a char boundary because `abs..abs+len`
+        // covered a complete UTF-8 substring (the matched needle).
+        // `abs + 1` would NOT be safe — it could land inside a
+        // multi-byte char and panic the next `haystack[start..]`.
+        start = abs + needle.len();
+        if start >= haystack.len() {
+            break;
+        }
     }
     false
 }
@@ -307,5 +322,26 @@ mod tests {
         assert!(!contains_whole_word("address book", "add"));
         assert!(!contains_whole_word("padded", "add"));
         assert!(contains_whole_word("see Foo::bar", "Foo::bar"));
+    }
+
+    #[test]
+    fn whole_word_survives_multibyte_chars_after_failed_match() {
+        // Repro of the crash that took down the bench setup on the
+        // Full corpus: a partial-but-rejected match (the needle is
+        // inside another identifier) immediately followed by an
+        // emoji would cause `start = abs + 1` to land mid-emoji and
+        // panic the next slice. With the fix (advance by
+        // needle.len()), the search just keeps going.
+        let h = "padded💰 then add() really";
+        assert!(contains_whole_word(h, "add"));
+    }
+
+    #[test]
+    fn whole_word_no_panic_when_only_match_is_inside_emoji_neighbour() {
+        // No real match — function must return false without
+        // panicking even when the haystack contains many emojis
+        // around the would-be match positions.
+        let h = "💰💰💰address💰💰💰";
+        assert!(!contains_whole_word(h, "add"));
     }
 }

@@ -35,14 +35,15 @@ done
 
 mkdir -p "$BENCH_DIR/results/with" "$BENCH_DIR/results/without"
 
-# Common flags. --bare gives us a minimal Claude Code (no hooks /
-# LSP / auto-memory / CLAUDE.md auto-discovery / etc.) so the
-# only intentional difference between the two setups is the MCP
-# config. --strict-mcp-config ensures only what we name is loaded.
+# Common flags. We intentionally do NOT use --bare — that flag skips
+# OAuth/keychain reads and would require ANTHROPIC_API_KEY in the
+# environment. Both runs use Claude Code's default auth, so the only
+# intentional difference between setups is whether the MCP server is
+# loaded. --strict-mcp-config ensures only what we name is loaded
+# (skips user / project / system MCP configs that might leak in).
 COMMON_FLAGS=(
   --print
   --output-format json
-  --bare
   --strict-mcp-config
   --no-session-persistence
   --max-budget-usd "$MAX_BUDGET"

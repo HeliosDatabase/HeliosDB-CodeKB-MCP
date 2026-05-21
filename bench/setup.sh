@@ -46,13 +46,33 @@ fi
 mkdir -p "$BENCH_DIR"
 echo "Bench dir: $BENCH_DIR"
 
+# Rsync excludes: mirror the engine's `ingest::SKIP_DIRS` + drop .git
+# (we don't ingest VCS metadata) so we don't waste minutes copying
+# hundreds of GB of build artifacts that the indexer would skip
+# anyway. On a typical engine-Full-sized corpus this shrinks the
+# rsync from ~400 GB to ~100 MB.
+RSYNC_EXCLUDES=(
+  --exclude=target          # Rust / Cargo build output
+  --exclude=node_modules    # JS / TS
+  --exclude=.git            # VCS metadata
+  --exclude=__pycache__     # Python bytecode
+  --exclude=.venv --exclude=venv
+  --exclude=.cache          # tooling caches
+  --exclude=dist --exclude=build --exclude=out
+  --exclude=.next --exclude=.nuxt
+  --exclude=vendor --exclude=Pods
+  --exclude=.gradle --exclude=.mvn
+  --exclude=.idea --exclude=.vscode
+  --exclude=.pytest_cache --exclude=.mypy_cache --exclude=.ruff_cache --exclude=.tox
+)
+
 for D in "$WITH_DIR" "$WITHOUT_DIR"; do
   if [[ ! -d "$D" ]]; then
-    echo "Copying $SRC_CORPUS → $D (this can take a while; rsync with --delete on re-run)…"
-    rsync -a --delete "$SRC_CORPUS"/ "$D"/
+    echo "Copying $SRC_CORPUS → $D (excluding build/cache/.git)…"
+    rsync -a --delete "${RSYNC_EXCLUDES[@]}" "$SRC_CORPUS"/ "$D"/
   else
-    echo "Refreshing $D from $SRC_CORPUS (rsync delete)…"
-    rsync -a --delete "$SRC_CORPUS"/ "$D"/
+    echo "Refreshing $D from $SRC_CORPUS (rsync delete, excluding build/cache/.git)…"
+    rsync -a --delete "${RSYNC_EXCLUDES[@]}" "$SRC_CORPUS"/ "$D"/
   fi
 done
 
