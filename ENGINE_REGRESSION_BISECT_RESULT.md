@@ -75,6 +75,20 @@ The plugin's `code_index` runs inside `TxnGuard::begin` (`src/ingest.rs:603-637`
 
 Total ~1.15 billion tuple comparisons. At ~350M comparisons/sec (rough order on a typical CPU with the bincode deserialise cost dominating), that's **~3,300s** — matching the observed 3,279s within noise.
 
+## v3.31.2 status (2026-05-19) — **T1 SHIPPED in PR #3, regression closed**
+
+Engine-side T1 fix landed at [Dimensigon/HDB-HeliosDB-Nano#3](https://github.com/dimensigon/HDB-HeliosDB-Nano/pull/3) and validated end-to-end against this report's repro corpus:
+
+| Engine pin | `code_index ms write=` | Total ingest |
+|---|---|---|
+| v3.22.2 (pre-regression baseline) | 9,709 ms | 35.1 s |
+| v3.30.0 (regressed) | 3,279,362 ms | ~55 min |
+| **v3.31.1 + PR #3** | **10,226 ms** | **59.1 s** |
+
+~321× speedup on the write phase, within 6% of the pre-v3.28.0 baseline. T2/T3/T4 from the proposal remain as follow-ups (session GUC, NOT ENFORCED dialect parsing, HeliosProxy fk-cache plugin).
+
+---
+
 ## Recommended engine fix shapes (priority order) — **ACCEPTED 2026-05-19 by gpc001ca user**
 
 User explicitly endorsed all three shapes as acceptable engine fixes; Nano agent is free to land any of them (or combine them) without further sign-off. Preference order is the order below.

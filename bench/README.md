@@ -6,7 +6,7 @@ developer questions about a real repo, run twice:
 - **WITH** — Claude Code + the `helios_*` MCP tools, with the source pre-indexed.
 - **WITHOUT** — Claude Code with the same built-in tools (Read, Grep, Glob, Bash) but no MCP server attached.
 
-Both runs use `--bare` (skip hooks / LSP / auto-memory) + `--strict-mcp-config` so the only intentional difference is the presence of the MCP server.
+Both runs use Claude Code's default auth + `--strict-mcp-config` (no `--bare`, because `--bare` skips OAuth/keychain reads and would require `ANTHROPIC_API_KEY`). The only intentional difference between setups is whether the MCP server is loaded.
 
 ## Gate — DO NOT RUN until engine T1 lands
 
@@ -76,6 +76,27 @@ The text responses live under `results/{with,without}/q{NN}.json` for side-by-si
 
 ## Limitations
 
-- Per-turn input/output/cache token breakdown isn't exposed by `claude -p --output-format json` today (only `total_cost_usd`). The dollar figure is the proxy for total token usage.
+- Per-turn breakdown of every tool call's tokens isn't exposed, but the JSON's top-level `usage` object DOES include `input_tokens`, `output_tokens`, `cache_creation_input_tokens`, and `cache_read_input_tokens` per call — `compare.sh` aggregates these.
+
+## Actual results (first run, 2026-05-20, Opus 4.7)
+
+Recorded against `~/HDB/Full` (101 MB after rsync excludes; 6 683 code + 400 text + 662 markdown files; 178 180 symbols; 731 732 refs; 45 189 doc nodes; 12.25 M MENTIONS edges). Default model in the running shell: `claude-opus-4-7[1m]`. Budget cap: $0.25 / question.
+
+| Metric | with MCP | without MCP | Δ |
+|---|---:|---:|---:|
+| Total $ cost (10 Q) | $2.35 | $2.05 | **+14.6 %** |
+| Total wall (s) | 213 | 199 | +7.0 % |
+| Cache-read tokens | 1.16 M | 0.92 M | +26.0 % |
+| Questions that **completed** | 5 / 10 | 9 / 10 | |
+| Questions that **hit budget cap with empty result** | **5 / 10** | 1 / 10 | |
+
+**WITH MCP was net-negative on this profile.** The MCP path made the agent take 4-7 turns instead of 2-3, with each turn cache-reading ~96 k tokens of `helios_*` tool output. Five WITH runs ran out of budget before producing an answer.
+
+Honest follow-ups not yet measured:
+
+- Run with `MODEL=claude-haiku-4-5-20251001` — the per-token economics change drastically for a small model on small lookups; MCP may pay back there.
+- Use HTTP-mode `serve` so the engine stays warm across calls instead of cold-starting each stdio invocation.
+- Append a system prompt steering the agent to prefer `helios_graphrag_search` over `Read + Grep` for this corpus.
+- Trim the `helios_lsp_*` response bodies — neighbouring-symbol context is currently always included.
 - One-shot runs only — no multi-turn dialogues. Some MCP value (cached subsequent calls) only shows over multi-turn workflows. Add a follow-up bench for that if you care.
 - The WITHOUT side will likely use `Bash(grep …)` and `Read` heavily. That's the realistic baseline a no-MCP agent has.
