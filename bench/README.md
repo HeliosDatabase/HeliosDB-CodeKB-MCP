@@ -78,25 +78,55 @@ The text responses live under `results/{with,without}/q{NN}.json` for side-by-si
 
 - Per-turn breakdown of every tool call's tokens isn't exposed, but the JSON's top-level `usage` object DOES include `input_tokens`, `output_tokens`, `cache_creation_input_tokens`, and `cache_read_input_tokens` per call — `compare.sh` aggregates these.
 
-## Actual results (first run, 2026-05-20, Opus 4.7)
+## Actual results
 
-Recorded against `~/HDB/Full` (101 MB after rsync excludes; 6 683 code + 400 text + 662 markdown files; 178 180 symbols; 731 732 refs; 45 189 doc nodes; 12.25 M MENTIONS edges). Default model in the running shell: `claude-opus-4-7[1m]`. Budget cap: $0.25 / question.
+Corpus across both runs: `~/HDB/Full` after rsync excludes — 101 MB on disk, 6 683 code + 400 text + 662 markdown files, 178 180 symbols, 731 732 refs, 45 189 doc graph nodes, 12.25 M MENTIONS edges. Same KB used by both model runs. Engine: heliosdb-nano 3.31.1 + the T1 fix (PR #3 on the engine repo). Budget cap: $0.25 / question. Same 10 questions from `questions.txt`.
 
-| Metric | with MCP | without MCP | Δ |
-|---|---:|---:|---:|
-| Total $ cost (10 Q) | $2.35 | $2.05 | **+14.6 %** |
-| Total wall (s) | 213 | 199 | +7.0 % |
-| Cache-read tokens | 1.16 M | 0.92 M | +26.0 % |
-| Questions that **completed** | 5 / 10 | 9 / 10 | |
-| Questions that **hit budget cap with empty result** | **5 / 10** | 1 / 10 | |
+### Aggregate
 
-**WITH MCP was net-negative on this profile.** The MCP path made the agent take 4-7 turns instead of 2-3, with each turn cache-reading ~96 k tokens of `helios_*` tool output. Five WITH runs ran out of budget before producing an answer.
+| Model | Setup | Total $ | Total wall | Completed | Cache-read tokens |
+|---|---|---:|---:|---:|---:|
+| Opus 4.7 (1M ctx) | with MCP | $2.35 | 213 s | **5 / 10** ⚠ | 1.16 M |
+| Opus 4.7 (1M ctx) | no MCP | $2.05 | 199 s | 9 / 10 | 0.92 M |
+| Haiku 4.5 | with MCP | $0.77 | 366 s | 10 / 10 | 2.38 M |
+| Haiku 4.5 | no MCP | $0.52 | 227 s | 10 / 10 | 1.90 M |
 
-Honest follow-ups not yet measured:
+- Opus + MCP hit the $0.25 budget cap **on 5 of 10 questions, returning no answer**. Net-negative on every metric (+14.6 % cost / +7 % wall / +26 % cache reads).
+- Haiku completed every question in both modes but **MCP added +49 % cost / +61 % wall** on average — the cache-read token volume per MCP tool call eats the model's lower per-token price.
 
-- Run with `MODEL=claude-haiku-4-5-20251001` — the per-token economics change drastically for a small model on small lookups; MCP may pay back there.
-- Use HTTP-mode `serve` so the engine stays warm across calls instead of cold-starting each stdio invocation.
-- Append a system prompt steering the agent to prefer `helios_graphrag_search` over `Read + Grep` for this corpus.
-- Trim the `helios_lsp_*` response bodies — neighbouring-symbol context is currently always included.
+### Where MCP actually helped (Haiku per-question)
+
+| Q | WITH cost | no-MCP cost | WITH turns | no-MCP turns | Verdict |
+|---|---:|---:|---:|---:|---|
+| q02 (WASM plugin docs) | $0.043 | $0.062 | 6 | 10 | **MCP −31 %** ✓ |
+| q08 (cache vs storage crates) | $0.030 | $0.058 | 4 | 9 | **MCP −48 %** ✓ |
+| q06 (default WAL sync mode) | $0.022 | $0.023 | 2 | 2 | tie |
+| q01 (FK validation location) | $0.246 | $0.119 | 3 | **22** | no-MCP cheaper but burned 22 turns of grep + read |
+
+### Where MCP lost badly (Haiku per-question)
+
+| Q | WITH | no-MCP | Failure mode |
+|---|---:|---:|---|
+| q05 (multi-tenancy module) | $0.085 | $0.039 | `helios_graphrag_search` returned 460 k cache-read tokens of subgraph |
+| q07 (HIGH_AVAILABILITY_OVERVIEW.md) | $0.070 | $0.036 | similar — large doc subgraph |
+| q10 (heliosdb-vector public types) | $0.074 | $0.030 | `helios_lsp_*` returned every type + signature blob |
+
+### Pattern across both models
+
+- Doc questions where the answer is one section → MCP wins (smaller chunk returned vs reading whole file).
+- Code-location questions where one symbol answers it → MCP loses (LSP returns surrounding context the agent doesn't need).
+- Conceptual / multi-symbol questions → MCP loses big (graph traversal returns large subgraph the agent has to digest).
+- Questions the agent already half-knows from common patterns → no-MCP wins (Read + Grep is cheap when targeted).
+
+### Honest verdict
+
+The infrastructure works end-to-end (T1 unblocked ingest, plugin compiles, tests green, bench is repeatable, both models produce real numbers). **The plugin is not yet a token saver in its current shape.** The MCP tool *result sizes* are tuned for richness, not minimality. Until that's tightened, Read + Grep beats it on a typical Q&A workflow with both Opus and Haiku.
+
+### Follow-up hypotheses not yet measured
+
+- **Trim the `helios_lsp_*` response bodies** — neighbouring-symbol context is currently always included; an `include_context: bool` argument defaulting to false would let the agent ask for verbosity explicitly. Biggest expected impact.
+- **HTTP-mode `serve`** so the engine stays warm across calls instead of cold-starting per stdio invocation. May matter less than tool-result trimming.
+- **`--append-system-prompt`** steering the agent to prefer `helios_graphrag_search` for doc questions and `Read + Grep` for known-symbol lookups. Currently the agent uses MCP enthusiastically and pays for it.
+- **Re-run with a small-doc-heavy corpus** (e.g. a Python project with many `.md` files) — DocSection heading chunking should shine there. Full's signal is code-dominated.
 - One-shot runs only — no multi-turn dialogues. Some MCP value (cached subsequent calls) only shows over multi-turn workflows. Add a follow-up bench for that if you care.
 - The WITHOUT side will likely use `Bash(grep …)` and `Read` heavily. That's the realistic baseline a no-MCP agent has.
