@@ -7,6 +7,29 @@ LSP-shaped + GraphRAG tools to Claude Code, Cursor, Codex, Aider,
 and any other MCP-aware agent — over plain stdio JSON-RPC, no
 ports, no auth dance, all local.
 
+## What this plugin actually buys you
+
+Measured on a real corpus (see [`bench/README.md`](./bench/README.md)),
+the value proposition is **not** "saves N % tokens on every query."
+The honest picture across 10 typical dev questions × multiple trials
+with both Haiku 4.5 and Opus 4.7:
+
+| Scenario | What the plugin gives you |
+|---|---|
+| **Q where one Read+Grep nails it** | Plain Claude Code is already cheap. MCP adds modest overhead (cache reads for tool descriptions + tool results). Plugin loses 10-30 % on this profile. |
+| **Q that sends the agent on a multi-turn grep tour** | Without the plugin, Opus has hit the per-call budget cap with no answer; Haiku has burned 22-32 turns of Read+Grep. With the plugin, the same question lands in 3-6 turns. **This is the catastrophe-prevention value** — it stabilises the tail, not the median. |
+| **Cross-modal queries** ("which doc section mentions the `FastEmbedder` symbol?") | `Read`+`Grep` literally can't answer in one shot. The plugin's text → code `MENTIONS` edges traverse both sides in one tool call. **Read+Grep has no equivalent.** |
+| **Time-travel, branch diff, AST diff** | `helios_ast_diff`, `heliosdb_branch_*`, `heliosdb_time_travel` answer "what did this symbol look like at commit X / on branch Y" with typed AST deltas. **Read+Grep cannot do this at all** — you'd need to checkout, build the index against the older state, and grep again. |
+| **Doc retrieval that returns one section, not the whole file** | When the `.md` ingest used `ChunkStrategy::Headings`, `helios_graphrag_search` returns the matching `DocSection` instead of the full file. Smaller chunks = direct token savings on doc-heavy workflows. |
+
+**What the plugin does NOT do well (yet):**
+
+- It is not consistently cheaper than Read+Grep on simple symbol lookups with a small model. The bench shows 1.5-2× run-to-run variance and the median is roughly even with no-MCP after three Haiku trials.
+- `helios_lsp_*` and `helios_graphrag_search` default to returning rich context (neighbouring symbols, full doc-section bodies). The plugin ships an opt-in `--max-tool-result-bytes` trimmer, but blunt trimming costs more than it saves on this workload — the agent treats the `…[truncated]` marker as a Read-fallback signal.
+- The biggest win-back lever — having the engine expose `verbose: false` modes for each tool — lives engine-side. Tracked in `bench/README.md` "follow-up hypotheses".
+
+Use the plugin when the cross-modal / time-travel / catastrophe-prevention value matters. Don't deploy it expecting token savings on a Haiku Q&A workload.
+
 ## Install
 
 ### Pre-built binary (recommended)

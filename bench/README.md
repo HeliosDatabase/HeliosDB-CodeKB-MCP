@@ -52,6 +52,26 @@ bench/run.sh                                    # ~minutes — fires the questio
 bench/compare.sh > bench/results/SUMMARY.md     # prints comparison
 ```
 
+### Multi-trial (recommended for stable numbers)
+
+A single run swings ~1.5-2× due to agent variance. Run 3+ trials:
+
+```bash
+TRIALS=3 bench/run.sh          # 10 Q × 3 trials × 2 setups = 60 calls
+bench/compare.sh > bench/results/SUMMARY.md
+# compare.sh detects qNN-tT.json automatically and reports per-Q
+# median + min + max plus a totals row that sums the medians.
+```
+
+### Steering test (prompt-tells-agent-to-prefer-MCP)
+
+```bash
+STEER=1 bench/run.sh                                  # writes to with-steered/ + without-steered/
+SUFFIX=-steered bench/compare.sh > bench/results/SUMMARY-steered.md
+```
+
+Combine: `TRIALS=3 STEER=1 bench/run.sh` for a multi-trial steered run.
+
 ## What "fair comparison" means here
 
 - **Same source corpus.** Both setups have access to identical files at
