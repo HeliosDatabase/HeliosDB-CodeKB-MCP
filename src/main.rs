@@ -33,6 +33,7 @@ mod config;
 mod ingest;
 mod kb;
 mod linker;
+mod mcp_trim;
 mod quality;
 
 use config::Config;
@@ -70,6 +71,21 @@ enum Commands {
         /// Examples: `127.0.0.1:8765`, `0.0.0.0:8765`, `[::1]:8765`.
         #[arg(long, value_name = "ADDR")]
         http: Option<String>,
+
+        /// Cap each string field in a `tools/call` response at N bytes
+        /// (UTF-8 char-boundary safe). Larger strings get an
+        /// `…[+N bytes truncated]` marker so the agent knows what was
+        /// dropped. `0` disables trimming (the engine's full response
+        /// passes through unchanged). Currently only honoured on the
+        /// stdio transport; HTTP path always passes through.
+        ///
+        /// Why this exists: `helios_lsp_*` and `helios_graphrag_search`
+        /// return neighbouring-symbol bodies and full doc-section text
+        /// by default, which bloats agent context and costs tokens.
+        /// See `bench/README.md` for the measurement that motivated
+        /// this flag.
+        #[arg(long, value_name = "N", default_value_t = 0)]
+        max_tool_result_bytes: usize,
     },
 
     /// Create / configure a KB for a source path. Persists the choice
@@ -219,7 +235,11 @@ async fn main() -> Result<()> {
     let cli = Cli::parse();
 
     match cli.command {
-        Commands::Serve { source, http } => serve(&source, http.as_deref()).await,
+        Commands::Serve {
+            source,
+            http,
+            max_tool_result_bytes,
+        } => serve(&source, http.as_deref(), max_tool_result_bytes).await,
         Commands::Init {
             source,
             mode,
@@ -293,7 +313,11 @@ async fn main() -> Result<()> {
     }
 }
 
-async fn serve(source: &std::path::Path, http: Option<&str>) -> Result<()> {
+async fn serve(
+    source: &std::path::Path,
+    http: Option<&str>,
+    max_tool_result_bytes: usize,
+) -> Result<()> {
     let cfg = Config::load_or_default()?;
     let spec = cfg
         .lookup_for_source(source)
@@ -313,12 +337,20 @@ async fn serve(source: &std::path::Path, http: Option<&str>) -> Result<()> {
 
     match http {
         None => {
-            tracing::info!("starting MCP stdio server");
-            let mut server = heliosdb_nano::mcp::McpServer::new(db);
-            server
-                .run()
-                .await
-                .map_err(|e| anyhow::anyhow!("MCP server failed: {e}"))
+            if max_tool_result_bytes == 0 {
+                tracing::info!("starting MCP stdio server (engine loop, no trimming)");
+                let mut server = heliosdb_nano::mcp::McpServer::new(db);
+                server
+                    .run()
+                    .await
+                    .map_err(|e| anyhow::anyhow!("MCP server failed: {e}"))
+            } else {
+                tracing::info!(
+                    cap = max_tool_result_bytes,
+                    "starting MCP stdio server (plugin loop with tool-result trimming)"
+                );
+                stdio_loop_with_trim(db.as_ref(), max_tool_result_bytes).await
+            }
         }
         Some(addr) => {
             // Bind axum's MCP router on the requested address.  The
@@ -353,6 +385,88 @@ async fn serve(source: &std::path::Path, http: Option<&str>) -> Result<()> {
                 .map_err(|e| anyhow::anyhow!("MCP HTTP server failed: {e}"))
         }
     }
+}
+
+/// Custom JSON-RPC stdio loop that mirrors `heliosdb_nano::mcp::McpServer::run`
+/// but post-processes every response through `crate::mcp_trim` before
+/// writing it to stdout. Used when the user passes `--max-tool-result-bytes
+/// <N>` to trim oversized tool result bodies for token savings.
+///
+/// Caveats vs the engine's loop:
+///
+/// * No streaming-progress dispatch (the engine's loop has a special
+///   path for `tools/call` with `_meta.progressToken` that emits
+///   `notifications/progress` mid-call). The bench workload doesn't
+///   use progress tokens, and the trim mode is opt-in, so we keep the
+///   simple variant. If a request includes a progressToken we still
+///   serve it — just synchronously, with the trim applied to the
+///   final response (no per-chunk streaming notifications).
+/// * `initialized` notifications are no-ops, same as the engine.
+async fn stdio_loop_with_trim(db: &heliosdb_nano::EmbeddedDatabase, max_bytes: usize) -> Result<()> {
+    use heliosdb_nano::mcp::rpc::{handle_rpc_with_db, RpcRequest, RpcResponse};
+    use std::io::{BufRead, BufReader, Write};
+
+    let stdin = std::io::stdin();
+    let mut stdout = std::io::stdout();
+    let reader = BufReader::new(stdin.lock());
+
+    for line in reader.lines() {
+        let line = match line {
+            Ok(l) => l,
+            Err(e) => {
+                tracing::error!(error = %e, "stdin read failed");
+                continue;
+            }
+        };
+        if line.trim().is_empty() {
+            continue;
+        }
+
+        let req: RpcRequest = match serde_json::from_str(&line) {
+            Ok(r) => r,
+            Err(e) => {
+                // Wire-level parse error — emit a JSON-RPC parse-error
+                // response so the client can recover.
+                let err = serde_json::json!({
+                    "jsonrpc": "2.0",
+                    "id": serde_json::Value::Null,
+                    "error": { "code": -32700, "message": format!("Parse error: {e}") }
+                });
+                writeln!(stdout, "{}", err)
+                    .and_then(|()| stdout.flush())
+                    .map_err(|e| anyhow::anyhow!("stdout write failed: {e}"))?;
+                continue;
+            }
+        };
+
+        // `initialized` is a notification — no response.
+        if req.method == "initialized" {
+            continue;
+        }
+
+        let is_tools_call = req.method == "tools/call";
+        let resp: RpcResponse = handle_rpc_with_db(db, req);
+        let json = match serde_json::to_string(&resp) {
+            Ok(j) => j,
+            Err(e) => {
+                tracing::error!(error = %e, "response serialize failed");
+                continue;
+            }
+        };
+
+        // Trim only `tools/call` responses — schemas / discovery /
+        // resources stay intact.
+        let out_line = if is_tools_call {
+            crate::mcp_trim::trim_rpc_response_wire(&json, max_bytes)
+        } else {
+            json
+        };
+
+        writeln!(stdout, "{}", out_line)
+            .and_then(|()| stdout.flush())
+            .map_err(|e| anyhow::anyhow!("stdout write failed: {e}"))?;
+    }
+    Ok(())
 }
 
 fn init(
