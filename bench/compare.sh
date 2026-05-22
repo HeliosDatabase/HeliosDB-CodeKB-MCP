@@ -1,52 +1,35 @@
 #!/usr/bin/env bash
-# Aggregate cost + wall time from per-question JSON results into a
-# markdown comparison table. Prints to stdout — redirect to file.
+# Aggregate cost / wall / token fields from per-question JSON results
+# into a markdown comparison table. Prints to stdout — redirect to
+# file. Supports the multi-trial output shape (qNN-tT.json) by
+# computing per-question median + min + max across trials; falls back
+# to single-value rows when there's only one trial.
 #
-# Reads $BENCH_DIR/results/{with,without}/qNN.json. The JSON shape
-# (per `claude -p --output-format json`) includes at least:
-#   .total_cost_usd   number
-#   .result           string (the assistant's text response)
-#   .bench.wall_secs  number (decorated by run.sh)
-#   .bench.exit_code  number (decorated by run.sh)
-# Extra usage fields (input_tokens, output_tokens, …), if present, are
-# detected by `jq -r 'paths | join(".")'` and surfaced.
+# Env vars:
+#   BENCH_DIR     where the results live (matches bench/run.sh)
+#   SUFFIX        "" or "-steered" — picks which results dir pair to
+#                 compare. Default "". To compare steered vs bare
+#                 directly, run compare.sh twice with different
+#                 SUFFIXes and diff the outputs.
 
 set -euo pipefail
 
 BENCH_DIR="${BENCH_DIR:-${TMPDIR:-/tmp}/codekb-bench-$(date +%Y%m%d)}"
-RES_WITH="$BENCH_DIR/results/with"
-RES_WITHOUT="$BENCH_DIR/results/without"
+SUFFIX="${SUFFIX:-}"
+RES_WITH="$BENCH_DIR/results/with${SUFFIX}"
+RES_WITHOUT="$BENCH_DIR/results/without${SUFFIX}"
 
 if [[ ! -d "$RES_WITH" || ! -d "$RES_WITHOUT" ]]; then
-  echo "No results found under $BENCH_DIR/results. Did bench/run.sh finish?" >&2
+  echo "No results found under $BENCH_DIR/results (SUFFIX=$SUFFIX). Did bench/run.sh finish?" >&2
   exit 1
 fi
 
-# Detect any token-usage fields that landed in the JSON (varies by
-# Claude Code version). Probe the first WITH result; reuse for all.
-probe="$(ls "$RES_WITH"/q*.json 2>/dev/null | head -1)"
-extra_fields=()
-if [[ -n "$probe" ]]; then
-  while IFS= read -r p; do
-    extra_fields+=("$p")
-  done < <(jq -r '
-    paths(scalars) as $p
-    | $p | join(".")
-    | select(test("token|usage|cache"; "i"))
-  ' "$probe" 2>/dev/null | sort -u)
-fi
-
-# Per-question extractor — pulls the same shape regardless of setup.
-# Order matters; downstream tooling reads positional fields.
+# Extract one row of fields from one JSON file.
 emit() {
-  local label="$1" file="$2"
-  # Note: jq variable named `$lbl`, not `$label` — `label` is a jq
-  # reserved keyword (used for early-termination) and bare `$label`
-  # makes the parser error with "unexpected label".
+  local file="$1"
   if [[ -f "$file" ]]; then
-    jq -r --arg lbl "$label" '
+    jq -r '
       [
-        $lbl,
         (.total_cost_usd // 0),
         (.bench.wall_secs // 0),
         (.bench.exit_code // 0),
@@ -57,79 +40,132 @@ emit() {
         (.usage.cache_read_input_tokens // 0),
         (.num_turns // 0)
       ] | @tsv
-    ' "$file" 2>/dev/null || echo -e "${label}\t0\t0\tparse_err\t0\t0\t0\t0\t0\t0"
+    ' "$file" 2>/dev/null || echo -e "0\t0\t0\t0\t0\t0\t0\t0\t0"
   else
-    echo -e "${label}\t-\t-\tmissing\t-\t-\t-\t-\t-\t-"
+    echo -e "-\t-\t-\t-\t-\t-\t-\t-\t-"
   fi
 }
 
+# Median of a stream of numbers (one per line). Empty input → 0.
+median() {
+  awk '{a[NR]=$1} END{
+    if (NR==0) {print 0; exit}
+    n=asort(a)
+    if (n%2==1) print a[(n+1)/2]
+    else printf "%.6f\n", (a[n/2]+a[n/2+1])/2
+  }'
+}
+minv() { awk 'NR==1||$1<m{m=$1} END{if(NR==0)print 0; else print m}'; }
+maxv() { awk '$1>m{m=$1} END{if(NR==0)print 0; else print m}'; }
+sumv() { awk '{s+=$1} END{print s+0}'; }
+
+# Detect trials per question by counting matching files.
+shopt -s nullglob
+detect_trials() {
+  local dir="$1" q="$2"
+  local n=0
+  for f in "$dir"/"$q".json "$dir"/"$q"-t*.json; do
+    [[ -f "$f" ]] && n=$((n + 1))
+  done
+  echo "$n"
+}
+
+# Enumerate question stems (qNN) from the WITH side.
+questions=$(
+  for f in "$RES_WITH"/q*.json; do
+    [[ -f "$f" ]] || continue
+    basename "$f" .json | sed -E 's/-t[0-9]+$//'
+  done | sort -u
+)
+
 echo "# Bench summary — heliosdb-codekb MCP vs no MCP"
 echo
-echo "Source corpus: \`${SRC_CORPUS:-/home/gpc/HDB/Full}\`. Generated: $(date -u +%Y-%m-%dT%H:%M:%SZ)."
+echo "Source corpus: \`${SRC_CORPUS:-/home/gpc/HDB/Full}\`. Suffix: \`${SUFFIX:-<none>}\`. Generated: $(date -u +%Y-%m-%dT%H:%M:%SZ)."
 echo
-echo "## Per-question results"
+
+echo "## Per-question results (median across trials)"
 echo
-echo "| Q | Setup | \$ cost | wall_s | exit | resp_chars | in_tok | out_tok | cache_in | cache_read | turns |"
-echo "|----|---------|--------:|-------:|-----:|-----------:|-------:|--------:|---------:|-----------:|------:|"
+echo "| Q | Setup | trials | \$ cost (med / min / max) | wall_s med | resp_chars med | turns med |"
+echo "|----|---------|------:|---:|---:|---:|---:|"
 
-total_cost_with=0;  total_cost_without=0
-total_wall_with=0;  total_wall_without=0
-total_in_with=0;    total_in_without=0
-total_out_with=0;   total_out_without=0
-total_cin_with=0;   total_cin_without=0
-total_cread_with=0; total_cread_without=0
-n=0
+n_q=0
+overall_cost_with_sum=0; overall_cost_without_sum=0
+overall_wall_with_sum=0; overall_wall_without_sum=0
+overall_in_with_sum=0;  overall_in_without_sum=0
+overall_out_with_sum=0; overall_out_without_sum=0
+overall_cin_with_sum=0; overall_cin_without_sum=0
+overall_cr_with_sum=0;  overall_cr_without_sum=0
 
-for w in "$RES_WITH"/q*.json; do
-  [[ -e "$w" ]] || continue
-  q="$(basename "$w" .json)"
-  wo="$RES_WITHOUT/$q.json"
-  n=$((n + 1))
+for q in $questions; do
+  n_q=$((n_q + 1))
+  for side in with without; do
+    if [[ "$side" == "with" ]]; then dir="$RES_WITH"; else dir="$RES_WITHOUT"; fi
+    files=("$dir"/"$q".json "$dir"/"$q"-t*.json)
+    real=()
+    for f in "${files[@]}"; do [[ -f "$f" ]] && real+=("$f"); done
+    t=${#real[@]}
+    if (( t == 0 )); then
+      printf "| %s | %-7s | %d | - | - | - | - |\n" "$q" "$side" 0
+      continue
+    fi
 
-  IFS=$'\t' read -r _ cw  sw  ew  rw  iw  ow  ciw  crw  tw  <<<"$(emit with    "$w")"
-  IFS=$'\t' read -r _ cwo swo ewo rwo iwo owo ciwo crwo two <<<"$(emit without "$wo")"
+    # Build vectors of each metric across trials.
+    costs=""; walls=""; resps=""; ins=""; outs=""; cins=""; crs=""; turns=""
+    for f in "${real[@]}"; do
+      IFS=$'\t' read -r c w _ r in_ out cin cr tu <<<"$(emit "$f")"
+      costs+="$c"$'\n'; walls+="$w"$'\n'; resps+="$r"$'\n'
+      ins+="$in_"$'\n'; outs+="$out"$'\n'; cins+="$cin"$'\n'; crs+="$cr"$'\n'
+      turns+="$tu"$'\n'
+    done
 
-  printf "| %s | with    | %.5f | %4s | %2s | %8s | %6s | %6s | %7s | %8s | %3s |\n" \
-    "$q" "${cw:-0}"  "$sw"  "$ew"  "$rw"  "$iw"  "$ow"  "$ciw"  "$crw"  "$tw"
-  printf "| %s | without | %.5f | %4s | %2s | %8s | %6s | %6s | %7s | %8s | %3s |\n" \
-    "$q" "${cwo:-0}" "$swo" "$ewo" "$rwo" "$iwo" "$owo" "$ciwo" "$crwo" "$two"
+    cost_med=$(echo -n "$costs" | median)
+    cost_min=$(echo -n "$costs" | minv)
+    cost_max=$(echo -n "$costs" | maxv)
+    wall_med=$(echo -n "$walls" | median)
+    resp_med=$(echo -n "$resps" | median)
+    turns_med=$(echo -n "$turns" | median)
 
-  total_cost_with=$(awk -v a="$total_cost_with"   -v b="${cw:-0}"   'BEGIN{print a + b}')
-  total_cost_without=$(awk -v a="$total_cost_without" -v b="${cwo:-0}" 'BEGIN{print a + b}')
-  total_wall_with=$((total_wall_with + ${sw:-0}))
-  total_wall_without=$((total_wall_without + ${swo:-0}))
-  total_in_with=$((total_in_with     + ${iw:-0}))
-  total_in_without=$((total_in_without  + ${iwo:-0}))
-  total_out_with=$((total_out_with    + ${ow:-0}))
-  total_out_without=$((total_out_without + ${owo:-0}))
-  total_cin_with=$((total_cin_with    + ${ciw:-0}))
-  total_cin_without=$((total_cin_without + ${ciwo:-0}))
-  total_cread_with=$((total_cread_with  + ${crw:-0}))
-  total_cread_without=$((total_cread_without + ${crwo:-0}))
+    printf "| %s | %-7s | %d | %.5f / %.5f / %.5f | %s | %s | %s |\n" \
+      "$q" "$side" "$t" "$cost_med" "$cost_min" "$cost_max" "$wall_med" "$resp_med" "$turns_med"
+
+    # For totals we sum the medians (representative per-question cost).
+    if [[ "$side" == "with" ]]; then
+      overall_cost_with_sum=$(awk -v a="$overall_cost_with_sum" -v b="$cost_med" 'BEGIN{print a+b}')
+      overall_wall_with_sum=$(awk -v a="$overall_wall_with_sum" -v b="$wall_med" 'BEGIN{print a+b}')
+      overall_in_with_sum=$(awk -v a="$overall_in_with_sum" -v b="$(echo -n "$ins" | median)" 'BEGIN{print a+b}')
+      overall_out_with_sum=$(awk -v a="$overall_out_with_sum" -v b="$(echo -n "$outs" | median)" 'BEGIN{print a+b}')
+      overall_cin_with_sum=$(awk -v a="$overall_cin_with_sum" -v b="$(echo -n "$cins" | median)" 'BEGIN{print a+b}')
+      overall_cr_with_sum=$(awk -v a="$overall_cr_with_sum" -v b="$(echo -n "$crs" | median)" 'BEGIN{print a+b}')
+    else
+      overall_cost_without_sum=$(awk -v a="$overall_cost_without_sum" -v b="$cost_med" 'BEGIN{print a+b}')
+      overall_wall_without_sum=$(awk -v a="$overall_wall_without_sum" -v b="$wall_med" 'BEGIN{print a+b}')
+      overall_in_without_sum=$(awk -v a="$overall_in_without_sum" -v b="$(echo -n "$ins" | median)" 'BEGIN{print a+b}')
+      overall_out_without_sum=$(awk -v a="$overall_out_without_sum" -v b="$(echo -n "$outs" | median)" 'BEGIN{print a+b}')
+      overall_cin_without_sum=$(awk -v a="$overall_cin_without_sum" -v b="$(echo -n "$cins" | median)" 'BEGIN{print a+b}')
+      overall_cr_without_sum=$(awk -v a="$overall_cr_without_sum" -v b="$(echo -n "$crs" | median)" 'BEGIN{print a+b}')
+    fi
+  done
 done
 
 echo
-echo "## Totals ($n questions)"
+echo "## Totals (sum of per-question medians, $n_q questions)"
 echo
-echo "| Metric                       | with MCP | without MCP | Δ (with − without) | Δ %       |"
-echo "|------------------------------|---------:|------------:|-------------------:|----------:|"
-delta_cost=$(awk -v a="$total_cost_with" -v b="$total_cost_without" 'BEGIN{print a - b}')
-delta_wall=$((total_wall_with - total_wall_without))
-delta_in=$((total_in_with - total_in_without))
-delta_out=$((total_out_with - total_out_without))
-delta_cin=$((total_cin_with - total_cin_without))
-delta_cread=$((total_cread_with - total_cread_without))
+echo "| Metric | with MCP | without MCP | Δ (with − without) | Δ % |"
+echo "|---|---:|---:|---:|---:|"
 pct() { awk -v a="$1" -v b="$2" 'BEGIN{ if (b==0) print "n/a"; else printf "%+.1f%%\n", 100*(a-b)/b }'; }
-printf "| total_cost_usd               | %.6f | %.6f | %+.6f | %s |\n" "$total_cost_with" "$total_cost_without" "$delta_cost"  "$(pct $total_cost_with $total_cost_without)"
-printf "| total_wall_secs              | %8s | %11s | %+18s | %s |\n" "$total_wall_with"  "$total_wall_without" "$delta_wall"  "$(pct $total_wall_with $total_wall_without)"
-printf "| total_input_tokens           | %8s | %11s | %+18s | %s |\n" "$total_in_with"    "$total_in_without"   "$delta_in"    "$(pct $total_in_with    $total_in_without)"
-printf "| total_output_tokens          | %8s | %11s | %+18s | %s |\n" "$total_out_with"   "$total_out_without"  "$delta_out"   "$(pct $total_out_with   $total_out_without)"
-printf "| total_cache_creation_tokens  | %8s | %11s | %+18s | %s |\n" "$total_cin_with"   "$total_cin_without"  "$delta_cin"   "$(pct $total_cin_with   $total_cin_without)"
-printf "| total_cache_read_tokens      | %8s | %11s | %+18s | %s |\n" "$total_cread_with" "$total_cread_without" "$delta_cread" "$(pct $total_cread_with $total_cread_without)"
-
+delta() { awk -v a="$1" -v b="$2" 'BEGIN{printf "%+.6f\n", a-b}'; }
+delta_int() { awk -v a="$1" -v b="$2" 'BEGIN{printf "%+d\n", a-b}'; }
+printf "| total_cost_usd | %.6f | %.6f | %s | %s |\n" "$overall_cost_with_sum" "$overall_cost_without_sum" "$(delta "$overall_cost_with_sum" "$overall_cost_without_sum")" "$(pct "$overall_cost_with_sum" "$overall_cost_without_sum")"
+printf "| total_wall_secs | %s | %s | %s | %s |\n" "$overall_wall_with_sum" "$overall_wall_without_sum" "$(delta_int "$overall_wall_with_sum" "$overall_wall_without_sum")" "$(pct "$overall_wall_with_sum" "$overall_wall_without_sum")"
+printf "| total_input_tokens | %s | %s | %s | %s |\n" "$overall_in_with_sum" "$overall_in_without_sum" "$(delta_int "$overall_in_with_sum" "$overall_in_without_sum")" "$(pct "$overall_in_with_sum" "$overall_in_without_sum")"
+printf "| total_output_tokens | %s | %s | %s | %s |\n" "$overall_out_with_sum" "$overall_out_without_sum" "$(delta_int "$overall_out_with_sum" "$overall_out_without_sum")" "$(pct "$overall_out_with_sum" "$overall_out_without_sum")"
+printf "| total_cache_creation_tokens | %s | %s | %s | %s |\n" "$overall_cin_with_sum" "$overall_cin_without_sum" "$(delta_int "$overall_cin_with_sum" "$overall_cin_without_sum")" "$(pct "$overall_cin_with_sum" "$overall_cin_without_sum")"
+printf "| total_cache_read_tokens | %s | %s | %s | %s |\n" "$overall_cr_with_sum" "$overall_cr_without_sum" "$(delta_int "$overall_cr_with_sum" "$overall_cr_without_sum")" "$(pct "$overall_cr_with_sum" "$overall_cr_without_sum")"
 echo
 echo "## How to interpret"
 echo
+echo "- Per-question table uses the **median** across trials so a single bad run doesn't dominate. Min and max alongside it give a sense of variance."
+echo "- Totals sum the per-question medians — a representative per-question cost rolled up."
 echo "- A **lower** \`total_cost_usd\` with MCP means the MCP path saved tokens."
-echo "- A **shorter** \`response_chars\` for MCP runs might mean either tighter answers (good) or the model gave up (bad). Spot-check the text under \`$BENCH_DIR/results/{with,without}/qNN.json -> .result\`."
-echo "- An \`exit\` of non-zero in either run usually means \`--max-budget-usd\` was hit before the agent finished, which is itself a data point."
+echo "- For multi-trial robustness: at least 3 trials per question (TRIALS=3 on bench/run.sh)."
+echo "- For prompt-steering comparison: run twice with STEER=0 and STEER=1, then run \`SUFFIX=-steered bench/compare.sh\` to see the steered numbers."

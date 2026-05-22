@@ -1,13 +1,29 @@
 #!/usr/bin/env bash
-# For each question in bench/questions.txt × each setup (with/without),
-# run `claude -p` in headless mode and save the JSON output. Each call
-# is capped at $0.25 worst-case.
+# For each question × each setup (with/without MCP), run `claude -p`
+# in headless mode and save the JSON output. Each call is capped at
+# $0.25 worst-case.
+#
+# Modes (env vars):
+#   TRIALS=N    repeat each question/setup N times, writing to
+#               qNN-tT.json (default 1; recommended 3-5 for stable
+#               numbers since agent runs vary 1.5-2× between trials)
+#   STEER=1     prepend an --append-system-prompt-file that nudges
+#               the agent to prefer `helios_*` MCP tools for code/doc
+#               lookups on this corpus. Results land in a parallel
+#               results/{with,without}-steered/ tree so you can
+#               compare bare-vs-steered without re-running the
+#               un-steered baseline.
+#   MODEL=…     pin a specific model (e.g. claude-haiku-4-5-20251001).
+#               Default is whatever the user's shell has configured.
+#   MAX_BUDGET_USD=… per-call dollar cap (default 0.25).
 #
 # Outputs:
-#   $BENCH_DIR/results/with/qNN.json
-#   $BENCH_DIR/results/without/qNN.json
+#   $BENCH_DIR/results/with/qNN-tT.json
+#   $BENCH_DIR/results/without/qNN-tT.json
+#   (and …-steered variants when STEER=1)
 #
-# Re-running overwrites existing per-question JSON files; safe to interrupt.
+# Re-running overwrites existing per-question JSON files; safe to
+# interrupt.
 
 set -euo pipefail
 
@@ -20,11 +36,14 @@ BENCH_DIR="${BENCH_DIR:-${TMPDIR:-/tmp}/codekb-bench-$(date +%Y%m%d)}"
 QUESTIONS="${QUESTIONS:-$(dirname "$0")/questions.txt}"
 MAX_BUDGET="${MAX_BUDGET_USD:-0.25}"
 MODEL="${MODEL:-}"
+TRIALS="${TRIALS:-1}"
+STEER="${STEER:-0}"
 
 WITH_DIR="$BENCH_DIR/full-with"
 WITHOUT_DIR="$BENCH_DIR/full-without"
 MCP_ON="$BENCH_DIR/mcp-on.json"
 MCP_OFF="$(dirname "$0")/mcp-off.json"
+STEER_PROMPT="$(dirname "$0")/steer-prompt.md"
 
 for required in "$WITH_DIR" "$WITHOUT_DIR" "$MCP_ON" "$MCP_OFF"; do
   if [[ ! -e "$required" ]]; then
@@ -32,8 +51,18 @@ for required in "$WITH_DIR" "$WITHOUT_DIR" "$MCP_ON" "$MCP_OFF"; do
     exit 1
   fi
 done
+if [[ "$STEER" == "1" && ! -f "$STEER_PROMPT" ]]; then
+  echo "STEER=1 but $STEER_PROMPT is missing." >&2
+  exit 1
+fi
 
-mkdir -p "$BENCH_DIR/results/with" "$BENCH_DIR/results/without"
+# Suffix the results dir when steered so we can keep both side-by-
+# side without overwriting the bare baseline.
+SUFFIX=""
+[[ "$STEER" == "1" ]] && SUFFIX="-steered"
+WITH_RES="$BENCH_DIR/results/with${SUFFIX}"
+WITHOUT_RES="$BENCH_DIR/results/without${SUFFIX}"
+mkdir -p "$WITH_RES" "$WITHOUT_RES"
 
 # Common flags. We intentionally do NOT use --bare — that flag skips
 # OAuth/keychain reads and would require ANTHROPIC_API_KEY in the
@@ -50,6 +79,15 @@ COMMON_FLAGS=(
   --permission-mode bypassPermissions
 )
 [[ -n "$MODEL" ]] && COMMON_FLAGS+=(--model "$MODEL")
+if [[ "$STEER" == "1" ]]; then
+  # --append-system-prompt-file is the supported way to inject text
+  # into the system prompt without overriding the default. Same
+  # prompt applied to BOTH setups so the comparison stays apples-
+  # to-apples (the agent is told about helios_* tools even when no
+  # MCP server is loaded — the without-MCP run then has to ignore
+  # the suggestion, which is its own data point).
+  COMMON_FLAGS+=(--append-system-prompt-file "$STEER_PROMPT")
+fi
 
 run_one() {
   local question="$1"
@@ -76,6 +114,7 @@ run_one() {
 }
 
 i=0
+total_runs=0
 while IFS= read -r line; do
   # Strip leading/trailing whitespace, skip blank / comment lines.
   q="${line#"${line%%[![:space:]]*}"}"
@@ -84,10 +123,25 @@ while IFS= read -r line; do
   i=$((i + 1))
   printf -v num "%02d" "$i"
   echo "Q$num: $q"
-  run_one "$q" "$BENCH_DIR/results/with/q$num.json"    "$WITH_DIR"    "$MCP_ON"
-  run_one "$q" "$BENCH_DIR/results/without/q$num.json" "$WITHOUT_DIR" "$MCP_OFF"
+  for t in $(seq 1 "$TRIALS"); do
+    printf -v ts "%d" "$t"
+    if [[ "$TRIALS" == "1" ]]; then
+      # Keep the old qNN.json naming when there's only one trial so
+      # existing tooling / saved comparisons keep working.
+      tag=""
+    else
+      tag="-t$ts"
+    fi
+    run_one "$q" "$WITH_RES/q${num}${tag}.json"    "$WITH_DIR"    "$MCP_ON"
+    run_one "$q" "$WITHOUT_RES/q${num}${tag}.json" "$WITHOUT_DIR" "$MCP_OFF"
+    total_runs=$((total_runs + 2))
+  done
 done < "$QUESTIONS"
 
 echo
-echo "Done. $i questions × 2 setups = $((i * 2)) runs."
-echo "Next: bench/compare.sh > $BENCH_DIR/results/SUMMARY.md"
+echo "Done. $i questions × $TRIALS trial(s) × 2 setups = $total_runs runs."
+if [[ "$STEER" == "1" ]]; then
+  echo "Results: $WITH_RES, $WITHOUT_RES"
+else
+  echo "Next: bench/compare.sh > $BENCH_DIR/results/SUMMARY.md"
+fi
