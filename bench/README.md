@@ -84,15 +84,33 @@ Corpus across both runs: `~/HDB/Full` after rsync excludes — 101 MB on disk, 6
 
 ### Aggregate
 
-| Model | Setup | Total $ | Total wall | Completed | Cache-read tokens |
-|---|---|---:|---:|---:|---:|
-| Opus 4.7 (1M ctx) | with MCP | $2.35 | 213 s | **5 / 10** ⚠ | 1.16 M |
-| Opus 4.7 (1M ctx) | no MCP | $2.05 | 199 s | 9 / 10 | 0.92 M |
-| Haiku 4.5 | with MCP | $0.77 | 366 s | 10 / 10 | 2.38 M |
-| Haiku 4.5 | no MCP | $0.52 | 227 s | 10 / 10 | 1.90 M |
+| Model | Setup | Engine | Total $ | Total wall | Completed | Cache-read tokens |
+|---|---|---|---:|---:|---:|---:|
+| Opus 4.7 (1M ctx) | with MCP   | T1 patch (2026-05-20) | $2.35 | 213 s | **5 / 10** ⚠ | 1.16 M |
+| Opus 4.7 (1M ctx) | no MCP     | T1 patch (2026-05-20) | $2.05 | 199 s | 9 / 10 | 0.92 M |
+| Haiku 4.5         | with MCP   | T1 patch (2026-05-20) | $0.77 | 366 s | 10 / 10 | 2.38 M |
+| Haiku 4.5         | no MCP     | T1 patch (2026-05-20) | $0.52 | 227 s | 10 / 10 | 1.90 M |
+| Haiku 4.5         | **with MCP**   | **3.31.2 release (2026-05-22)** | **$0.47** | **258 s** | **10 / 10** | **1.76 M** |
+| Haiku 4.5         | **no MCP**     | **3.31.2 release (2026-05-22)** | **$0.88** | **584 s** | **9 / 10** ⚠ | **3.44 M** |
+| Haiku 4.5         | with MCP, **trim=800** | 3.31.2 release (2026-05-22, hyp #1) | $0.55 | 240 s | 10 / 10 | 2.40 M |
+| Haiku 4.5         | no MCP                  | 3.31.2 release (2026-05-22, hyp #1) | $0.43 | 190 s | 10 / 10 | 1.70 M |
 
-- Opus + MCP hit the $0.25 budget cap **on 5 of 10 questions, returning no answer**. Net-negative on every metric (+14.6 % cost / +7 % wall / +26 % cache reads).
-- Haiku completed every question in both modes but **MCP added +49 % cost / +61 % wall** on average — the cache-read token volume per MCP tool call eats the model's lower per-token price.
+- Opus + MCP hit the $0.25 budget cap on 5 of 10 questions, returning no answer. Net-negative on every metric (+14.6 % cost / +7 % wall / +26 % cache reads).
+- Haiku on 2026-05-20 (yesterday) completed every question in both modes but **MCP added +49 % cost / +61 % wall** — the cache-read token volume per MCP tool call eats Haiku's lower per-token price.
+- Haiku on 2026-05-22 (today, same KB, same questions, same model — only the engine was bumped from a [patch] build to the 3.31.2 release, functionally identical to yesterday's binary) shows **MCP −47 % cost / −56 % wall / −49 % cache-reads** — a complete flip. **The swing is dominated by agent run variance, not engine change.** Yesterday no-MCP runs were fast and lean; today two no-MCP runs catastrophed:
+  - q01 (FK validation): no-MCP took **32 turns** of Read+Grep ($0.22, 200 s).
+  - q04 (time-travel API): no-MCP hit the $0.25 cap with no answer.
+- The honest read: **one bench run is not statistically stable.** Need 3–5 trials × per question to get confidence intervals. Today's result says MCP can absolutely shine when no-MCP thrashes, but doesn't prove MCP is intrinsically cheaper across a balanced workload.
+
+### Hypothesis #1 (tried, negative): trim MCP tool result bodies
+
+Added a `--max-tool-result-bytes <N>` flag to `serve` (see `src/mcp_trim.rs` + `src/main.rs::stdio_loop_with_trim`). When set, the plugin replaces the engine's stdio loop with one that calls `handle_rpc_with_db` and walks the JSON response, truncating any string field longer than N bytes at the nearest char boundary and appending `…[+N bytes truncated]`. Char-boundary safe (same lesson as the linker emoji bug). 6 unit tests cover the trimmer.
+
+Bench at cap=800 bytes (above table, rows 5-6) ran net-negative: WITH-MCP cost **+27 %** vs no-MCP, cache-read tokens **+41 %**. Inspection of q01 showed why: the agent treats the `…[truncated]` marker as a signal that data exists somewhere, then calls `Read` on the source file to recover it — **trimming shifted cost to the next tool call instead of saving it**.
+
+Variance across the three Haiku runs above (same model, same KB, same 10 questions) is larger than the trim-cap effect: WITH cost swung from $0.47 → $0.55 → $0.77 across runs without any code change capable of explaining it. **Single-run benches are not statistically reliable for this workload.** Multi-trial measurement is the next step.
+
+The trim feature stays in tree as an experimental knob (off by default — `--max-tool-result-bytes 0`). Useful for workloads where the agent should NOT fall back to Read (e.g. sandbox modes that disable filesystem access), or for tuning above 2000 bytes to clip pathological subgraph blobs without triggering the Read-fallback pattern.
 
 ### Where MCP actually helped (Haiku per-question)
 

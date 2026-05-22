@@ -2,7 +2,11 @@
   "mcpServers": {
     "helios": {
       "command": "@@BIN@@",
-      "args": ["serve", "--source", "@@WITH_DIR@@"]
+      "args": [
+        "serve",
+        "--source", "@@WITH_DIR@@",
+        "--max-tool-result-bytes", "800"
+      ]
     }
   }
 }
