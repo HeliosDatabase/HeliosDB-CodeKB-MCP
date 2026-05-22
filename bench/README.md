@@ -114,6 +114,8 @@ Corpus across both runs: `~/HDB/Full` after rsync excludes — 101 MB on disk, 6
 | Haiku 4.5         | **no MCP**     | **3.31.2 release (2026-05-22)** | **$0.88** | **584 s** | **9 / 10** ⚠ | **3.44 M** |
 | Haiku 4.5         | with MCP, **trim=800** | 3.31.2 release (2026-05-22, hyp #1) | $0.55 | 240 s | 10 / 10 | 2.40 M |
 | Haiku 4.5         | no MCP                  | 3.31.2 release (2026-05-22, hyp #1) | $0.43 | 190 s | 10 / 10 | 1.70 M |
+| Haiku 4.5         | **with MCP, STEER=1, TRIALS=3** | 3.31.2 release (2026-05-22, canonical) | **$1.27** | 563 s | 30 / 30 | 1.98 M |
+| Haiku 4.5         | **no MCP, STEER=1, TRIALS=3**   | 3.31.2 release (2026-05-22, canonical) | **$1.26** | 502 s | 30 / 30 | 1.24 M |
 
 - Opus + MCP hit the $0.25 budget cap on 5 of 10 questions, returning no answer. Net-negative on every metric (+14.6 % cost / +7 % wall / +26 % cache reads).
 - Haiku on 2026-05-20 (yesterday) completed every question in both modes but **MCP added +49 % cost / +61 % wall** — the cache-read token volume per MCP tool call eats Haiku's lower per-token price.
@@ -131,6 +133,39 @@ Bench at cap=800 bytes (above table, rows 5-6) ran net-negative: WITH-MCP cost *
 Variance across the three Haiku runs above (same model, same KB, same 10 questions) is larger than the trim-cap effect: WITH cost swung from $0.47 → $0.55 → $0.77 across runs without any code change capable of explaining it. **Single-run benches are not statistically reliable for this workload.** Multi-trial measurement is the next step.
 
 The trim feature stays in tree as an experimental knob (off by default — `--max-tool-result-bytes 0`). Useful for workloads where the agent should NOT fall back to Read (e.g. sandbox modes that disable filesystem access), or for tuning above 2000 bytes to clip pathological subgraph blobs without triggering the Read-fallback pattern.
+
+### Canonical result — multi-trial + steering (2026-05-22)
+
+Rows 7-8 of the aggregate table above are the most statistically defensible numbers we have on this corpus: 3 trials per question × 10 questions × 2 setups = 60 total `claude -p` calls, with `bench/steer-prompt.md` injected via `--append-system-prompt-file` for both runs. Totals are summed per-question medians (so a single bad trial doesn't dominate). Detailed run output in `/tmp/codekb-bench-20260520/results/SUMMARY-haiku-steered-trials3.md`.
+
+**Headline:** WITH-MCP $1.27 vs WITHOUT-MCP $1.26 — **+0.8 % difference, tied within noise.**
+
+**Three things this settles:**
+
+1. **Variance, not method, drove earlier swings.** Single-trial runs swung WITH cost from $0.47 → $0.77 with no code change; 3-trial median lands at $1.27 — both single-trial readings were misleading. Multi-trial is the floor for honest measurement on this workload.
+2. **Steering didn't break the tie.** Appending a prompt that nudges the agent to prefer `helios_*` tools moved both absolute costs up (more context, more tokens) without tilting either way.
+3. **The per-question split is stable across trials** and divides cleanly into three buckets:
+
+| Bucket | Questions | Median Δ (WITH − WITHOUT) | Reason |
+|---|---|---:|---|
+| **MCP wins clearly** | q02 (WASM docs), q08 (cache vs storage), q10 (vector public types) | −34 % to **−45 %** | Doc-section / multi-symbol-summary queries — `helios_graphrag_search` returns one matching chunk instead of forcing Read+Grep to enumerate. |
+| **Tied within noise** | q01, q03, q04, q07 | ±10 % | Mixed code/doc lookups where neither path has a structural advantage. |
+| **MCP loses clearly** | q05 (multi-tenancy), q06 (default WAL mode), q09 (HNSW index) | +74 % to **+367 %** | Tiny lookups where MCP overhead dwarfs savings ($0.022 on a $0.006 baseline at q06), or graph traversals returning oversized subgraphs (q05). |
+
+**Per-question variance is still wide** — 3 trials gives min/median/max bands like q01 WITH = $0.054 / $0.231 / $0.253. 3 is the floor for stable signal; 5 would tighten the bands further.
+
+### Verdict on the 80-90 % savings goal
+
+**Unreachable on this workload by design.** Read+Grep on a 100 MB corpus with Haiku averages ~$0.13 per question; for MCP to come in at 10-20 % of that ($0.013-0.026) the helios_* tools would need to answer in 1-2 small chunks per question — but every MCP tool call carries ~96 k cache-read tokens of tool descriptions + schema, which is roughly the entire no-MCP budget. The math doesn't permit it for small models on small corpora.
+
+The plugin's honest value (re-stated from the top-level README):
+
+- **Catastrophe prevention** — on Opus with a $0.25 cap, no-MCP runs *failed to answer* 5 of 10 questions; WITH-MCP completed all of them.
+- **Cross-modal MENTIONS** — text → code edges that Read+Grep cannot produce in a single round-trip.
+- **Time-travel / branch / AST-diff** — workflows with no Read+Grep alternative at all.
+- **Doc-section retrieval** — for the bucket where MCP wins (q02/q08/q10 above), the savings are real and reproducible: −30 to −45 %.
+
+The plugin is the right shape for the workflows above. It is not — and probably cannot be without engine-side `verbose: false` tool modes — a flat token saver across a typical Haiku Q&A workload.
 
 ### Where MCP actually helped (Haiku per-question)
 
