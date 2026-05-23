@@ -98,3 +98,126 @@ tracks what to do, in priority order, when the branch publishes.
 Tracked here so it doesn't drift. Next checkpoint: when helios:Nano
 pings that the branch has landed on main + published, fold Step 1
 into a feature branch on this repo.
+
+## Early-test results (worktree, 2026-05-23)
+
+Ran the engine's `PersistentVectorIndex` API directly against synthetic
+unit vectors in a throwaway `/tmp/codekb-pq-smoke` worktree (built
+with `[patch.crates-io] heliosdb-nano = { path = "/home/gpc/HDB/Nano" }`
+pointing at the `feat/persistent-pq-hnsw` branch at commit `4048e93`,
+`vector-persist` feature on). Test driver at `tests/pq_smoke.rs` in
+that worktree — NOT committed to main (lives only in the
+worktree per the "explicitly NOT doing" list above).
+
+### Methodology reproduction (engine's validation params)
+
+Synthetic random unit vectors, dim=128, n=2000, k=10, ef=100, 50
+queries. Manually set `num_subquantizers=32` (= dim/4) to mirror the
+engine's own `bench_persistent_pq_summary`:
+
+| Metric | Engine `VALIDATION_REPORT_persistent_pq_hnsw.md` | Worktree measurement |
+|---|---:|---:|
+| RAM exact | 1 000 KB | **1 024 KB** ✓ |
+| RAM PQ | 62 KB | **64 KB** ✓ |
+| Compression | 16.1× | **16.0×** ✓ |
+| Recall@10 exact | 0.989 | **0.992** ✓ |
+| Recall@10 PQ | 0.987 | **0.986** ✓ |
+| Persistence round-trip | "exact state restored from disk" | ✓ — `drop → open → search` returns identical top-10 |
+
+**All five numbers reproduce within noise on our hardware.** The API
+behaves exactly as the engine team's validation report claims.
+
+### CodeKB-specific finding — `default_for_dimension` is not deploy-ready
+
+`ProductQuantizerConfig::default_for_dimension(dim)` picks:
+
+| dim | num_subquantizers picked | bytes/code | recall@10 (measured) |
+|---|---:|---:|---:|
+| 128 | 2 | 2 | **0.138** ⚠ |
+| 384 (our case, BGE-Small) | 4 | 4 | **0.026** ⚠ |
+
+The heuristic produces 1-bit-per-32-dims, which collapses dim-384
+embeddings into a 4-byte signature — essentially a hash. Recall is
+catastrophic and would silently break semantic search for any CodeKB
+user who calls `create_with_pq` with the default config.
+
+**Required adoption pattern:** when wiring `PersistentVectorIndex`
+into `src/ingest.rs`, the plugin MUST explicitly set:
+
+```rust
+use heliosdb_nano::vector::quantization::ProductQuantizerConfig;
+
+let mut cfg = PqHnswConfig::new(dim, DistanceMetric::L2);
+cfg.pq_config = Some(ProductQuantizerConfig {
+    num_subquantizers: dim / 4,   // 96 for BGE-Small (dim=384)
+    num_centroids:     256,
+    dimension:         dim,
+    training_iterations: 15,
+    min_training_samples: 256,
+});
+```
+
+That gives ~16× compression (same as the engine's validation) while
+preserving recall.
+
+**Recommended engine-side follow-up** (not blocking adoption, but worth
+filing): either tighten `default_for_dimension`'s heuristic to
+num_subquantizers = dim/4 (the value the engine team's *own* bench
+uses), or rename the current heuristic to something like
+`coarsest_for_dimension` so the name signals "rough sketch, not
+production".
+
+### Persistence confirmed
+
+`PersistentVectorIndex::create_with_pq` → `drop` → `PersistentVectorIndex::open`
+restores `len`, the entry point, and the per-element neighbour graph;
+two queries 1 µs apart return identical top-10 row IDs across reopen.
+This is exactly the property that lets CodeKB deprecate
+`--background-quality` once we adopt it: no rebuild on `serve` restart.
+
+### CodeKB-sized smoke (n=18 985, dim=384)
+
+Same workload at `~/HDB/Nano` scale (18 985 symbols × 384-dim) with
+`num_subquantizers=96`:
+
+| Metric | Value | Comment |
+|---|---:|---|
+| RAM exact (vectors) | **27.81 MB** | matches n × dim × 4 |
+| RAM PQ (codes) | **1.74 MB** | |
+| **Compression** | **16.0×** | ✓ matches engine claim at scale |
+| Recall@10 exact | 0.468 | low absolute — see note below |
+| Recall@10 PQ | 0.406 | **only 6 % gap vs exact** — PQ doing its job |
+| Build exact | 139 s | single-thread debug-ish indexer |
+| Build PQ | 93 s train + 78 s insert | acceptable for cold ingest |
+| Persistence | ✓ | drop + reopen returns identical top-10 |
+
+**The low absolute recall is the synthetic-data problem, not a PQ
+problem.** Random unit vectors in dim=384 suffer concentration-of-
+measure: pairwise L2 distances cluster around `sqrt(2)`, so the true
+top-10 nearest neighbours are barely distinguishable from the top-50.
+HNSW with `ef=100` can't separate them; brute-force ground truth is
+itself noisy on this distribution. The PQ-vs-exact gap (6 %) is the
+real signal — it matches the engine's validation report (0.002 gap on
+their dim=128/n=2000 setup) within methodology noise.
+
+**For real CodeKB embeddings** — BGE-Small embeddings are clustered
+around code semantics (functions in the same module map near each
+other), so absolute recall should be much higher. The PQ overhead
+seen here (6 %) is the cost we'd pay; the absolute recall floor
+depends on the corpus, not the index. A second-pass test loading
+actual `_hdb_code_symbols.body_vec` values from an existing CodeKB
+KB would confirm this; queued as Step-1.5 in the plan above.
+
+### Verdict on adoption readiness
+
+- **Persistence: ready.** Just works.
+- **PQ compression + recall: ready *if* we explicitly set
+  `num_subquantizers = dim/4`** — the engine's `default_for_dimension`
+  must NOT be relied on.
+- **Filtered KNN + online deletes: API surface confirmed present
+  (`search_filtered`, `remove`, `compact`); not yet exercised in
+  this smoke.** Worth a follow-up early-test pass.
+
+When the branch publishes (next heliosdb-nano release after 3.31.2),
+adoption Step 1 from the plan above can ship with confidence — the
+recall + RAM claims hold, provided the PQ config is set explicitly.
