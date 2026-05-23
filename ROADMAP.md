@@ -96,7 +96,20 @@ the `MENTIONS` edge.
   the fix via `cargo update -p heliosdb-nano` once T1 ships.
   Once T2 ships we may opt in to `SET helios.fk_validation = off` for
   the `code_index` window since the engine is the structurally-trusted
-  producer of both FK sides.
+  producer of both FK sides. **Status 2026-05-22: T1 shipped as
+  heliosdb-nano 3.31.2 on crates.io; plugin bumped.**
+
+- **Persistent PQ-HNSW vector index (opt-in)** — engine branch
+  `feat/persistent-pq-hnsw` carries an opt-in persistent vector index
+  with PQ compression (~16× RAM at ~equal recall), online deletes,
+  and filtered KNN. Adoption plan and step-by-step rollout in
+  [`NANO_PERSISTENT_PQ_HNSW_ADOPTION.md`](./NANO_PERSISTENT_PQ_HNSW_ADOPTION.md).
+  Three direct CodeKB wins: kills the in-RAM rebuild on restart (lets
+  us deprecate `--background-quality`), makes 100k+ symbol repos
+  practical on laptop RAM, and gives `helios_graphrag_search` a
+  pre-traversal filter (directly addresses the bench's q05/q07
+  oversized-subgraph losses). Blocked on engine branch merge +
+  crates.io publish.
 
 ## Tier 4 — future direction, post-v1.0
 
