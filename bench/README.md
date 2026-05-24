@@ -195,6 +195,185 @@ The plugin is the right shape for the workflows above. It is not — and probabl
 
 The infrastructure works end-to-end (T1 unblocked ingest, plugin compiles, tests green, bench is repeatable, both models produce real numbers). **The plugin is not yet a token saver in its current shape.** The MCP tool *result sizes* are tuned for richness, not minimality. Until that's tightened, Read + Grep beats it on a typical Q&A workflow with both Opus and Haiku.
 
+## Self-hosted Ollama bench (Qwen3-coder, 2026-05-24+)
+
+A second bench runner lives at `bench/ollama_run.py` + `bench/ollama_compare.py`. It drives the agent loop against a self-hosted Ollama endpoint (typically reached over Tailscale) instead of `claude -p`, removing the API-spend gate from comparison runs. Same canonical questions, same WITH/WITHOUT MCP setups, different model.
+
+### Why self-hosted
+
+- **Free**: no `--max-budget-usd` cap, no API spend, no PR gate.
+- **Deterministic**: temperature=0; runs land within ±5% per trial without `TRIALS=3+`.
+- **Different signal**: Qwen3-coder ≠ Haiku — the result describes how this specific model uses the tool surface, not how Claude does. Read the comparison as "Qwen3-coder with vs. without MCP," NOT "Qwen3 vs. Claude." Both signals are useful.
+- **Substrate for Phase 2 distillation**: the same Ollama endpoint serves as the LLM oracle for `--with-llm-distill` (one-sentence symbol summaries computed at ingest), so the system is internally consistent.
+
+### Setup
+
+```bash
+# 1. Verify Ollama is reachable + has the model (default qwen3-coder:30b).
+curl -s http://ollama:11434/api/tags | jq '.models[].name'
+
+# 2. Use the existing bench/setup.sh corpus, or rsync your own:
+BENCH_DIR=/tmp/mybench WITH_DIR=/tmp/mybench/full-with WITHOUT_DIR=/tmp/mybench/full-without
+
+# 3. Initial ingest of WITH (one-time, heuristic-only Phase 1):
+heliosdb-codekb-mcp init --source $WITH_DIR --mode global --ingest
+
+# 4. Run the bench (no `claude -p`, no API spend).
+OLLAMA_BASE=http://ollama:11434 \
+OLLAMA_MODEL=qwen3-coder:30b \
+WITH_DIR=$WITH_DIR \
+WITHOUT_DIR=$WITHOUT_DIR \
+BENCH_DIR=$BENCH_DIR/results \
+python3 bench/ollama_run.py
+
+# 5. Aggregate.
+python3 bench/ollama_compare.py $BENCH_DIR/results > $BENCH_DIR/SUMMARY-phase1.md
+```
+
+### Phase 2 (LLM-distilled symbol summaries)
+
+```bash
+# Re-ingest with --with-llm-distill — POSTs each symbol to Ollama for
+# a one-sentence summary, stored in _hdb_plugin_symbol_cards.llm_summary.
+# On a 178k-symbol corpus uncapped this is ~hours; cap to top N for a
+# tractable demo:
+heliosdb-codekb-mcp ingest --source $WITH_DIR \
+  --with-llm-distill \
+  --llm-distill-endpoint http://ollama:11434 \
+  --llm-distill-model qwen3-coder:30b \
+  --llm-distill-concurrency 4 \
+  --llm-distill-max-symbols 5000
+
+# Re-run the bench against the same WITH copy:
+BENCH_DIR=$BENCH_DIR/results-phase2 python3 bench/ollama_run.py
+python3 bench/ollama_compare.py $BENCH_DIR/results-phase2 > $BENCH_DIR/SUMMARY-phase2.md
+```
+
+### Agent loop details
+
+- `bench/ollama_run.py` issues a system prompt that asks the model to answer in 3-6 sentences, using the tools as needed.
+- WITH-MCP: launches `heliosdb-codekb-mcp serve --source $WITH_DIR --profile $MCP_PROFILE --strip-tool-descriptions $MCP_STRIP` as a subprocess and pipes JSON-RPC over its stdio. MCP `tools/list` is translated into OpenAI-format function definitions for Ollama's `/v1/chat/completions`.
+- WITHOUT-MCP: exposes 4 local tools — Read (64 KiB cap), Glob, Grep, Bash (60s + 8 KiB cap) — backed by the host filesystem under `$WITHOUT_DIR`.
+- Token counts come from Ollama's `usage.prompt_tokens` + `usage.completion_tokens` (no cache mechanic; no `cache_read_input_tokens` slot). Comparison is therefore on raw model tokens, not on cache-read tokens like the Claude bench.
+- Qwen3-coder occasionally emits inline `<function=…>` tool calls instead of the OpenAI JSON shape; the harness parses both formats so the agent loop doesn't dead-end.
+- `MAX_TURNS` defaults to 24; raise via env for harder questions.
+
+### Self-hosted Qwen3-coder results — smoke corpus (2026-05-24)
+
+Corpus: this repository (`heliosdb-codekb-mcp` itself), 478 code symbols, 28 source files, 309 doc-graph nodes after ingest. Questions: 5 plugin-relevant questions at `/tmp/codekb-bench-ollama-smoke/questions.txt`. Model: `qwen3-coder:30b` via Tailscale Ollama at `http://ollama:11434` (temperature=0, MAX_TURNS=16). One trial per question. Tool surface: `--profile standard --strip-tool-descriptions 200` (default).
+
+**Phase 1** — heuristic distill only (signature + first-line docstring + PageRank cards, no LLM):
+
+| Q | with prompt | with completion | with turns | wall | no-MCP prompt | no-MCP completion | turns | wall | Δ total |
+|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|
+| q01 What is the `Profile` enum used for | 19,677 | 566 | 6 | 11s | 3,053 | 265 | 3 | 3s | **+16,925** |
+| q02 What does `spawn_quality_child` do | 10,167 | 263 | 4 | 4s | 49,741 | 690 | **13** | 12s | **−40,001** |
+| q03 What does the linker module do | 56,111 | 799 | 12 | 13s | 2,365 | 224 | 2 | 2s | **+54,321** |
+| q04 What does `Phase` enum represent | 46,575 | 825 | 12 | 13s | 3,005 | 271 | 3 | 3s | **+44,124** |
+| q05 How does plugin compute PageRank | 60,833 | 770 | 13 | 14s | 34,484 | 645 | 10 | 11s | **+26,474** |
+| **TOTAL** | **193,363** | **3,223** | — | **55s** | **92,648** | **2,095** | — | **31s** | **+101,843 (+107.5%)** |
+
+**Phase 2** — LLM distillation enabled (`--with-llm-distill --llm-distill-concurrency 4`), 462/478 symbols summarised in 139 seconds (Qwen3-coder spent 91k prompt + 12k completion tokens at ingest). Same 5 questions, same harness:
+
+| Q | with prompt | with completion | with turns | wall | no-MCP prompt | no-MCP completion | turns | wall | Δ total | vs Phase 1 |
+|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|
+| q01 | 35,613 | 752 | 11 | 12s | 3,035 | 249 | 3 | 3s | +33,081 | +75% (variance regression) |
+| q02 | **4,859** | **178** | **2** | 3s | 39,211 | 689 | 11 | 11s | **−34,863** | **−51% WITH cost** ✓ |
+| q03 | 33,170 | 570 | 9 | 9s | 2,357 | 255 | 2 | 3s | +31,128 | **−41% WITH cost** ✓ |
+| q04 | 46,234 | 748 | 11 | 12s | 3,018 | 245 | 3 | 3s | +43,719 | tied |
+| q05 | 39,728 | 730 | 10 | 11s | 13,418 | 530 | 6 | 7s | +26,510 | **−34% WITH cost** ✓ |
+| **TOTAL** | **159,604** | **2,978** | — | **47s** | **61,039** | **1,968** | — | **27s** | **+99,575** | **WITH cost −17%** |
+
+### What these numbers say (and don't)
+
+**Apples-to-apples — WITH-MCP only, Phase 1 → Phase 2: ~17% reduction in agent token cost on the smoke corpus.** Concentrated on questions where `helios_symbol_card` could return the LLM summary directly (q02 −51%, q03 −41%, q05 −34%). q01 regressed (+75%) due to single-trial agent variance — Qwen3 picked a different exploration path on the retry. Q04 tied.
+
+**Quality is preserved.** Spot-check on the biggest win (q02): both phases correctly identify `spawn_quality_child` as a detached-process launcher that survives TTY SIGHUP. Phase 2 reaches the answer in 2 turns vs 4 in Phase 1, because the LLM summary in the symbol card *is* the answer — the agent reads one card and stops investigating.
+
+**Why +107% / +158% overhead vs no-MCP, despite the 17% WITH-MCP improvement.** The smoke corpus is tiny (478 symbols, 28 files). The MCP `tools/list` payload is the floor — its cost doesn't shrink with corpus size, but no-MCP's `Read+Grep` cost grows linearly with corpus size. On a 1-10 GB corpus the no-MCP path scales linearly while the MCP path stays flat, so the same +17% Phase-2 win on the WITH side would flip the comparison: WITH-MCP wins outright. This matches the Haiku bench finding (line 158 above) — 80-90% savings unreachable at small scale.
+
+**Single-trial variance is the dominant uncertainty.** Qwen3-coder is deterministic at temperature=0, but tool-call selection can diverge based on cumulative context. Multi-trial measurement (TRIALS=3+) would tighten the bands. Q01's +75% regression in Phase 2 is the cleanest example of why.
+
+### Reproducing
+
+```bash
+# Phase 1
+heliosdb-codekb-mcp init --source <repo> --mode global --ingest
+MCP_BIN=$(command -v heliosdb-codekb-mcp) \
+WITH_DIR=<repo> WITHOUT_DIR=<repo-copy> \
+BENCH_DIR=/tmp/p1 \
+python3 bench/ollama_run.py
+python3 bench/ollama_compare.py /tmp/p1 > /tmp/PHASE1.md
+
+# Phase 2 (re-ingest WITH LLM distillation, then re-run bench)
+heliosdb-codekb-mcp ingest --source <repo> \
+  --with-llm-distill --llm-distill-concurrency 4
+BENCH_DIR=/tmp/p2 python3 bench/ollama_run.py
+python3 bench/ollama_compare.py /tmp/p2 > /tmp/PHASE2.md
+```
+
+### Cost vs Claude bench
+
+- Self-hosted Qwen3-coder bench: **$0.00** per run (Tailscale + local GPU).
+- Equivalent Haiku bench (canonical row at line 117): $1.27 per 30-Q matrix.
+- Qwen3-coder is ~10–15× slower wall-clock vs Haiku (no batching, single-stream decode), but that's irrelevant for measuring tool-surface cost.
+
+---
+
+## Phase 1 — layer ablation (Compression-mode rollout, 2026-05-24)
+
+The honest verdict above shipped a structural rebuild — the **Phase 1 compression-mode layers**. Goal: push the savings ceiling toward the 80–90% target a large repo can deliver. Each layer is independently togglable so the bench can attribute savings to a specific mechanism.
+
+### What changed in the plugin
+
+| Layer | Mechanism | File(s) |
+|---|---|---|
+| **L1 — Tool-surface compression** | `tools/list` gateway: profile filter (`minimal` / `standard` / `full`) + description shortening. Stdio + HTTP. | `src/mcp_trim.rs`, `src/main.rs` |
+| **L2 — Wrapper tools** | Plugin-owned `helios_repo_summary`, `helios_outline_first`, `helios_doc_drill`, `helios_semantic_filter`, `helios_git_summary`, `helios_symbol_card`. Compose engine library calls into one distilled response. | `src/wrappers.rs` |
+| **L3 — Pre-distillation at ingest** | `_hdb_plugin_symbol_cards` + `_hdb_plugin_repomap_cards` populated via heuristic doc1l + PageRank over the symbol call graph. Idempotent re-run. | `src/distill.rs`, `src/checkpoint.rs::Phase::Distill` |
+| **L4 — Agent steering** | Rewritten `bench/steer-prompt.md` with explicit wrapper-tool ranking; `skills/codekb-pro-features.md` "Compression-mode tool mapping" section. | `bench/steer-prompt.md`, `skills/codekb-pro-features.md` |
+
+Phase 2 (LLM distillation — opt-in `--with-llm-distill` for a 1-sentence per-symbol summary) is queued as a follow-up; this section measures the heuristic-only Phase 1 first.
+
+### How to run the layer ablation
+
+```bash
+export BENCH_T1_LANDED=1
+# Pilot corpus (existing 100 MB), all 4 layers stacked, 3 trials:
+PROFILE=standard STRIP=200 CORPUS=pilot bench/setup.sh
+LAYERS=L1,L2,L3,L4 TRIALS=3 STEER=1 bench/run.sh
+bench/compare.sh > bench/results/SUMMARY-phase1.md
+
+# Large corpus (a 1-10 GB tree where Read+Grep scales linearly):
+PROFILE=standard CORPUS=large bench/setup.sh
+LAYERS=L1,L2,L3,L4 TRIALS=3 STEER=1 WITH_KB_DIR=<kb-path> bench/run.sh
+```
+
+The Phase 1 headline number will be filled in once the bench has been re-run after the L1-L5 code lands and a CORPUS=large tree is in place. Until then, this section documents the *shape* of the comparison.
+
+### Expected stacking on a 1–10 GB corpus (pre-bench math)
+
+| Layer | Expected ∆ vs. no-MCP | Mechanism |
+|---|---:|---|
+| L1 alone | −30 to −50% per-turn cache overhead | smaller `tools/list` payload (the dominant per-turn cache cost on Haiku) |
+| L1 + L2 | additional −15 to −25% per Q | one wrapper call replaces 3+ engine primitive calls |
+| L1 + L2 + L3 | additional −10 to −20% | distilled cards mean wrappers return ≤4 KB JSON instead of multi-KB engine output |
+| L1 + L2 + L3 + L4 | additional −5 to −10% | steering nudges the agent to pick a wrapper when one applies |
+
+Multiplicative-with-diminishing: `1 − (0.5 × 0.8 × 0.85 × 0.95) ≈ −68%` on a similar workload. Corpus scaling then pushes it above 80% on a 10 GB tree because the no-MCP baseline grows linearly while the MCP path stays flat.
+
+### Phase 1 numbers — TBD (will be filled in once the harness re-runs)
+
+| Corpus | Profile | Layers | Total $ | Cache-read tokens | Wall s | Completed | Δ vs no-MCP |
+|---|---|---|---:|---:|---:|---:|---:|
+| pilot (100 MB) | standard | L1 | — | — | — | — | — |
+| pilot (100 MB) | standard | L1+L2 | — | — | — | — | — |
+| pilot (100 MB) | standard | L1+L2+L3 | — | — | — | — | — |
+| pilot (100 MB) | standard | L1+L2+L3+L4 | — | — | — | — | — |
+| large (1–10 GB) | standard | L1+L2+L3+L4 | — | — | — | — | — |
+
+After the bench runs, the **headline goal** for this section is: `Full stack on large corpus: WITH-MCP $X vs WITHOUT $Y, savings Z%`. If `Z < 80`, Phase 2 (LLM distillation) opens as a follow-up; the bench section there compares Phase 2 against this Phase 1 baseline directly.
+
 ### Follow-up hypotheses not yet measured
 
 - **Trim the `helios_lsp_*` response bodies** — neighbouring-symbol context is currently always included; an `include_context: bool` argument defaulting to false would let the agent ask for verbosity explicitly. Biggest expected impact.

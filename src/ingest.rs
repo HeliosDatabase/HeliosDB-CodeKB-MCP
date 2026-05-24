@@ -156,6 +156,10 @@ pub struct IngestOptions {
     /// >~1 k files where a blocking embedding pass is awkward. See
     /// > `crate::quality` for the progress-file contract.
     pub background_quality: bool,
+    /// Phase 2 — opt-in LLM distillation pass. `Some(opts)` triggers
+    /// `crate::distill::build_llm_summaries` after the heuristic
+    /// distill phase. `None` runs heuristic-only Phase 1 distill.
+    pub llm_distill: Option<crate::distill::LlmDistillOptions>,
 }
 
 #[derive(Debug, Default)]
@@ -179,6 +183,36 @@ pub struct IngestSummary {
     /// Stats from the post-ingest entity linker (text→symbol
     /// `MENTIONS` edges via `link_exact_qualified`).
     pub links: Option<LinkerStats>,
+    /// Stats from the Layer 3 pre-distillation pass. None when the
+    /// quality-child path runs (parent owns distill).
+    pub distill: Option<DistillSummary>,
+    /// Stats from the Phase 2 LLM-distill pass (opt-in via
+    /// `--with-llm-distill`).
+    pub llm_distill: Option<LlmDistillSummary>,
+}
+
+/// Summary of the Layer 3 distill pass — small subset of the full
+/// `crate::distill::DistillStats` that we surface to operators.
+#[derive(Debug, Default, Clone)]
+#[allow(dead_code)]
+pub struct DistillSummary {
+    pub symbols_written: usize,
+    pub symbols_unchanged: usize,
+    pub files_written: usize,
+    pub pagerank_iters: u32,
+    pub pagerank_converged: bool,
+}
+
+/// Phase 2 LLM-distill pass summary — token totals come from the
+/// upstream chat endpoint's `usage` field.
+#[derive(Debug, Default, Clone)]
+#[allow(dead_code)]
+pub struct LlmDistillSummary {
+    pub written: usize,
+    pub unchanged: usize,
+    pub failed: usize,
+    pub total_prompt_tokens: u64,
+    pub total_completion_tokens: u64,
 }
 
 #[derive(Debug)]
@@ -495,6 +529,91 @@ pub fn ingest(db: &EmbeddedDatabase, opts: IngestOptions) -> Result<IngestSummar
                 summary.links = Some(stats);
             }
             Err(e) => tracing::warn!("link_mentions_bulk failed: {e}"),
+        }
+
+        // Step 3c — pre-distillation (Layer 3). Populates the plugin's
+        // `_hdb_plugin_symbol_cards` + `_hdb_plugin_repomap_cards`
+        // tables that back the `helios_repo_summary` /
+        // `helios_symbol_card` wrappers. Heuristic-only (no LLM); see
+        // `src/distill.rs`. Skipped on the quality-child path — the
+        // parent owns the distill pass.
+        if !is_quality_child {
+            crate::checkpoint::advance(
+                &opts.kb_dir,
+                &source_root_str,
+                crate::checkpoint::Phase::Distill,
+            )?;
+            let distill_started = Instant::now();
+            // Order matters: symbol cards first (PageRank's per-symbol
+            // doc1l projection wants them already in place for the
+            // repomap top-symbol JSON).
+            let sym_stats = match crate::distill::build_symbol_cards(db) {
+                Ok(s) => s,
+                Err(e) => {
+                    tracing::warn!("distill::build_symbol_cards failed: {e}");
+                    crate::distill::DistillStats::default()
+                }
+            };
+            let repo_stats = match crate::distill::build_repomap_cards(db) {
+                Ok(s) => s,
+                Err(e) => {
+                    tracing::warn!("distill::build_repomap_cards failed: {e}");
+                    crate::distill::DistillStats::default()
+                }
+            };
+            eprintln!(
+                "ingest phase: distill done in {:.1} s — {} symbol cards ({} unchanged), \
+                 {} file cards (pagerank {} iters, converged={})",
+                distill_started.elapsed().as_secs_f64(),
+                sym_stats.symbols_written,
+                sym_stats.symbols_unchanged,
+                repo_stats.files_written,
+                repo_stats.pagerank_iters,
+                repo_stats.pagerank_converged,
+            );
+            summary.distill = Some(DistillSummary {
+                symbols_written: sym_stats.symbols_written,
+                symbols_unchanged: sym_stats.symbols_unchanged,
+                files_written: repo_stats.files_written,
+                pagerank_iters: repo_stats.pagerank_iters,
+                pagerank_converged: repo_stats.pagerank_converged,
+            });
+
+            // Phase 2 — opt-in LLM distillation. Runs AFTER the
+            // heuristic build_symbol_cards so the LLM has the
+            // signature + doc1l + body excerpt available, and so
+            // re-runs are cheap (only new/changed symbols hit the
+            // LLM endpoint).
+            if let Some(ref llm_opts) = opts.llm_distill {
+                let llm_started = Instant::now();
+                eprintln!(
+                    "ingest phase: LLM distill starting — endpoint={} model={} concurrency={}",
+                    llm_opts.endpoint, llm_opts.model, llm_opts.concurrency
+                );
+                match crate::distill::build_llm_summaries(db, llm_opts) {
+                    Ok(stats) => {
+                        eprintln!(
+                            "ingest phase: LLM distill done in {:.1} s — {}/{} written ({} unchanged, {} failed), \
+                             tokens prompt={} completion={}",
+                            llm_started.elapsed().as_secs_f64(),
+                            stats.written,
+                            stats.candidates,
+                            stats.unchanged,
+                            stats.failed,
+                            stats.total_prompt_tokens,
+                            stats.total_completion_tokens,
+                        );
+                        summary.llm_distill = Some(LlmDistillSummary {
+                            written: stats.written,
+                            unchanged: stats.unchanged,
+                            failed: stats.failed,
+                            total_prompt_tokens: stats.total_prompt_tokens,
+                            total_completion_tokens: stats.total_completion_tokens,
+                        });
+                    }
+                    Err(e) => tracing::warn!("build_llm_summaries failed: {e}"),
+                }
+            }
         }
     }
 

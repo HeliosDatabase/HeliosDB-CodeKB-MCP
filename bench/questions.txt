@@ -12,3 +12,13 @@ In the docs, what does HIGH_AVAILABILITY_OVERVIEW.md cover?
 What's the difference between the heliosdb-cache and heliosdb-storage crates?
 Where is the HNSW index implementation and how are inserts maintained?
 List the public types exposed by the heliosdb-vector crate's main module.
+
+## broad-scan — questions that force the no-MCP baseline to walk many files.
+## Designed for the 1-10 GB `large` / `huge` corpora where Read+Grep
+## scales linearly while MCP wrappers stay flat.
+
+Describe the overall architecture of this codebase in 3 paragraphs.
+Where is rate limiting implemented, and what are the configurable knobs?
+List every place that handles user authentication or session validation.
+What modules depend on the storage layer, and how do they consume it?
+Summarise the public API surface a downstream user would interact with.

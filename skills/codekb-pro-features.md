@@ -46,6 +46,22 @@ and any MCP-aware client can hit `POST /`, `GET /ws`, `GET /sse`, or `GET /info`
 - `--durable-writes` on `ingest`: switch to `WalSyncModeConfig::Sync` (fsync per write). Default is `Async` since the KB is regenerable from source. Mention only if user explicitly asks for crash-safe ingest.
 - Result cache (engine-side per-process LRU): `read-only` tools like `helios_lsp_*` and `helios_graphrag_search` are auto-cached. Repeated identical calls cost zero engine work. Hit rate is visible via `/codekb-status --mcp-url …`.
 
+## Compression-mode tool mapping (Phase 1)
+
+The plugin ships six **wrapper tools** that compose engine library calls into one distilled response. They are smaller-by-design than the equivalent engine-primitive sequence. The agent should prefer them when one applies:
+
+| Question shape | Prefer this wrapper | Instead of |
+|---|---|---|
+| "Describe the architecture" / "what's the layout of this codebase" | `helios_repo_summary(detail="file_index")` | walking `Read` over many files |
+| Doc question ("where do the docs cover X") | `helios_outline_first(query="X")` → if needed, `helios_doc_drill(section_id)` | `helios_graphrag_search` returning whole DocChunks |
+| "Where is `X` defined / who calls it" | `helios_symbol_card(qualified_name="X")` | `Read` + `Grep` loop or `helios_lsp_definition` + `helios_lsp_references` separately |
+| "How does `X` work" (paraphrase semantic search) | `helios_semantic_filter(query="X", where_lang="rust")` | `helios_graphrag_search` with post-filter |
+| Diff / refactor audit ("what changed between A and B") | `helios_git_summary(commit_a, commit_b)` | `Bash(git diff)` |
+
+Each wrapper is gated by the active `--profile`. The default `standard` profile advertises all six plus a curated read-only engine subset; `minimal` drops the engine LSP/branch tools entirely; `full` is pass-through.
+
+**Falling back:** if a wrapper returns `{"status": "not_found"}` or `{"status": "cards_not_built"}`, drop down to the engine-primitive tools (`helios_lsp_*`, `helios_graphrag_search`). The wrappers degrade gracefully — they never block a question.
+
 ## What this plugin is NOT
 
 - **Not a code formatter / linter.** No `helios_format` / `helios_lint`. Use language-native tools.

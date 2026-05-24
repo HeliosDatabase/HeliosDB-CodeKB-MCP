@@ -34,6 +34,9 @@ pub enum Phase {
     CodeIndex,
     /// `graph_rag_ingest_docs` — projecting docs into the graph.
     GraphRag,
+    /// `distill::build_*_cards` — populating plugin-owned
+    /// `_hdb_plugin_*_cards` tables that back Layer 2 wrappers.
+    Distill,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

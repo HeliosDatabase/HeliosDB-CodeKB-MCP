@@ -23,7 +23,21 @@ chmod +x ~/.local/bin/heliosdb-codekb-mcp
 
 For macOS / aarch64 / other platforms: tell the user pre-built binaries are not yet published and offer to `cargo install --git https://github.com/dimensigon/heliosdb-codekb-mcp --features native-binary-docs` instead. Confirm before running.
 
-## 2. Ask about embeddings
+## 2. Ask about the MCP tool-surface profile
+
+**Prompt the user verbatim:**
+
+> Pick an MCP tool-surface profile for this project. Affects which `helios_*` / `heliosdb_*` tools are advertised to the agent — fewer tools = smaller per-turn cache cost (the tool catalogue rides along on every turn).
+>
+> - **`minimal`** — only the plugin's distilled wrappers (`helios_repo_summary`, `helios_outline_first`, `helios_doc_drill`, `helios_semantic_filter`, `helios_symbol_card`) plus `heliosdb_query`. Smallest surface; best for greenfield Claude Code sessions on this repo.
+> - **`standard`** *(default)* — wrappers + curated engine tools (read-only LSP, GraphRAG, hybrid search). Covers every canonical bench question and is the recommended starting point.
+> - **`full`** — pass-through, every tool the engine exposes (~33). Use when integrating new tools or when an agent needs the full surface.
+>
+> Default: **standard** (you can change later by editing `~/.config/heliosdb-codekb-mcp/config.toml`'s `[serve] profile = "…"`, or by passing `--profile <mode>` in your `.mcp.json` args).
+
+Wait for the answer. Save as `PROFILE=minimal|standard|full`. If the user picked anything other than `standard`, plan to add the `[serve]` section to their config TOML in step 7 below.
+
+## 3. Ask about embeddings
 
 **Prompt the user verbatim:**
 
@@ -36,13 +50,13 @@ For macOS / aarch64 / other platforms: tell the user pre-built binaries are not 
 
 Wait for the user's answer. Save it as `WITH_EMBEDDINGS=yes` or `WITH_EMBEDDINGS=no`.
 
-## 3. Pick the KB location mode
+## 4. Pick the KB location mode
 
 For most users, **co-located** is the right answer: the KB lives at `${CLAUDE_PROJECT_DIR}/.helios-kb` and is auto-added to `.gitignore`. If the project is on a slow / network-mounted filesystem, suggest `global` instead (KB at `~/.local/share/helios-kb/<slug>`).
 
 Default to `co-located` unless the user asks otherwise.
 
-## 4. Register the KB
+## 5. Register the KB
 
 ```bash
 heliosdb-codekb-mcp init --source "${CLAUDE_PROJECT_DIR}" --mode co-located
@@ -50,7 +64,7 @@ heliosdb-codekb-mcp init --source "${CLAUDE_PROJECT_DIR}" --mode co-located
 
 (Substitute the chosen mode if the user picked something else.)
 
-## 5. Run the ingest
+## 6. Run the ingest
 
 If `WITH_EMBEDDINGS=yes`, use **background-quality** mode so the agent gets the fast pass in ~26 s on a typical repo and the embedding pass runs detached:
 
@@ -64,7 +78,36 @@ If `WITH_EMBEDDINGS=no`, just the fast pass:
 heliosdb-codekb-mcp ingest --source "${CLAUDE_PROJECT_DIR}"
 ```
 
-## 6. Confirm and hand off
+## 7. Persist the profile (if non-default)
+
+If `PROFILE` is not `standard`, write it to the user-level config TOML so future `serve` invocations pick it up without `.mcp.json` edits. (Skip if `PROFILE=standard` — the binary's built-in default already matches.)
+
+```bash
+# Use the binary's config helper to find the path, then merge the
+# [serve] section in place (toml-aware merge via a tiny Python one-liner
+# to preserve other keys).
+CONFIG_PATH=$(heliosdb-codekb-mcp config path)
+python3 - "$CONFIG_PATH" "$PROFILE" <<'PY'
+import sys, tomllib, pathlib
+p, profile = pathlib.Path(sys.argv[1]), sys.argv[2]
+data = tomllib.loads(p.read_text()) if p.exists() else {}
+data.setdefault("serve", {})["profile"] = profile
+# tomllib has no dump; write back a minimal TOML manually.
+out = []
+for k, v in data.items():
+    if isinstance(v, dict):
+        out.append(f"[{k}]")
+        for sk, sv in v.items():
+            out.append(f'{sk} = "{sv}"' if isinstance(sv, str) else f"{sk} = {sv}")
+        out.append("")
+    else:
+        out.insert(0, f'{k} = "{v}"' if isinstance(v, str) else f"{k} = {v}")
+p.write_text("\n".join(out).rstrip() + "\n")
+PY
+echo "wrote [serve] profile = \"$PROFILE\" to $CONFIG_PATH"
+```
+
+## 8. Confirm and hand off
 
 After ingest exits, run:
 
