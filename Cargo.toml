@@ -30,6 +30,15 @@ native-binary-docs = ["dep:pdf-extract", "dep:docx-rs", "dep:calamine"]
 # wins for the formats it supports; native handles fallbacks).
 docling = []
 
+# Enables the `helios_semantic_filter` wrapper. Today a no-op flag —
+# the wrapper handler is stubbed with an explanatory error until the
+# engine publishes the `vector-persist` feature on crates.io (branch
+# `feat/persistent-pq-hnsw`, validated in
+# NANO_PERSISTENT_PQ_HNSW_ADOPTION.md). Once the engine publishes,
+# re-declare this feature as `["heliosdb-nano/vector-persist"]` and
+# rewrite `wrappers::semantic_filter_handler` to call the live API.
+wrappers-semantic = []
+
 [dependencies]
 # Version requirement: any 3.x ≥ 3.22.2 (caret-style). Pinned to the
 # 3.x major because the engine's MCP/code-graph/graph-rag surface

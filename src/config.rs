@@ -5,6 +5,10 @@
 //! ```toml
 //! default_mode = "global"            # used when `init` is invoked without --mode
 //!
+//! [serve]
+//! profile = "standard"               # minimal | standard | full (default standard)
+//! strip_tool_descriptions = "200"    # int | "none" | "all"
+//!
 //! [kbs."/abs/path/to/source"]
 //! mode     = "co-located"
 //! kb_dir   = "/abs/path/to/source/.helios-kb"
@@ -14,6 +18,11 @@
 //! Keys in `[kbs.…]` are absolute, canonicalised source paths. The
 //! same `kb_dir` may appear under multiple keys when the user picked
 //! `mode = "hybrid"` to share one KB across sources.
+//!
+//! The `[serve]` section is consumed by `Commands::Serve` as a default
+//! for the `--profile` / `--strip-tool-descriptions` flags. CLI args
+//! always win; config TOML is the second-priority source; the
+//! built-in defaults (`standard` / `200`) are the last fallback.
 
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
@@ -28,6 +37,8 @@ use crate::kb::{KbMode, KbSpec};
 pub struct Config {
     #[serde(default = "default_mode_default")]
     pub default_mode: KbMode,
+    #[serde(default)]
+    pub serve: ServeConfig,
     #[serde(default)]
     pub kbs: BTreeMap<String, StoredKb>,
 }
@@ -44,10 +55,23 @@ pub struct StoredKb {
     pub created: String,
 }
 
+/// User-level defaults for `Commands::Serve`. CLI flags override these.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct ServeConfig {
+    /// MCP tool-surface profile: `minimal` | `standard` | `full`.
+    /// `None` ⇒ binary falls back to `standard`.
+    pub profile: Option<String>,
+    /// How much of each tool's `description` to keep in `tools/list`.
+    /// Accepts an integer (cap at N bytes), `"none"`, or `"all"`.
+    /// `None` ⇒ binary falls back to `"200"`.
+    pub strip_tool_descriptions: Option<String>,
+}
+
 impl Default for Config {
     fn default() -> Self {
         Self {
             default_mode: KbMode::Global,
+            serve: ServeConfig::default(),
             kbs: BTreeMap::new(),
         }
     }
@@ -190,6 +214,28 @@ mod tests {
         let parsed: Config = toml::from_str(&s).unwrap();
         assert_eq!(parsed.default_mode, KbMode::Global);
         assert!(parsed.kbs.is_empty());
+    }
+
+    #[test]
+    fn serve_section_round_trips() {
+        let mut cfg = Config::default();
+        cfg.serve.profile = Some("minimal".to_string());
+        cfg.serve.strip_tool_descriptions = Some("all".to_string());
+        let s = cfg.to_toml().unwrap();
+        let parsed: Config = toml::from_str(&s).unwrap();
+        assert_eq!(parsed.serve.profile.as_deref(), Some("minimal"));
+        assert_eq!(parsed.serve.strip_tool_descriptions.as_deref(), Some("all"));
+    }
+
+    #[test]
+    fn missing_serve_section_is_default() {
+        // Pre-Layer-1 configs have no [serve] section. Parse must
+        // succeed and leave the fields as None so the binary uses
+        // built-in defaults.
+        let legacy = r#"default_mode = "global""#;
+        let parsed: Config = toml::from_str(legacy).unwrap();
+        assert!(parsed.serve.profile.is_none());
+        assert!(parsed.serve.strip_tool_descriptions.is_none());
     }
 
     #[test]

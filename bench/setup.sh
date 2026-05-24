@@ -28,11 +28,26 @@ EOF
   exit 2
 fi
 
-SRC_CORPUS="${SRC_CORPUS:-/home/gpc/HDB/Full}"
-BENCH_DIR="${BENCH_DIR:-${TMPDIR:-/tmp}/codekb-bench-$(date +%Y%m%d)}"
+CORPUS="${CORPUS:-pilot}"   # pilot | large | huge
+
+case "$CORPUS" in
+  pilot) DEFAULT_SRC="/home/gpc/HDB/Full" ;;
+  large) DEFAULT_SRC="${HOME}/HDB/linux" ;;   # multi-language ~1-5 GB
+  huge)  DEFAULT_SRC="${HOME}/HDB/multi" ;;   # ~10 GB polyglot tree
+  *) echo "Unknown CORPUS=$CORPUS — expected pilot|large|huge" >&2; exit 2 ;;
+esac
+
+SRC_CORPUS="${SRC_CORPUS:-$DEFAULT_SRC}"
+BENCH_DIR="${BENCH_DIR:-${TMPDIR:-/tmp}/codekb-bench-${CORPUS}-$(date +%Y%m%d)}"
 WITH_DIR="$BENCH_DIR/full-with"
 WITHOUT_DIR="$BENCH_DIR/full-without"
 BIN="${HELIOS_BIN:-$(command -v heliosdb-codekb-mcp || echo "$PWD/target/release/heliosdb-codekb-mcp")}"
+
+# Default gateway-config slots in mcp-on.json. Bench/run.sh can override
+# at run time without re-running setup.sh.
+PROFILE="${PROFILE:-standard}"
+STRIP="${STRIP:-200}"
+MAX_TOOL_RESULT_BYTES="${MAX_TOOL_RESULT_BYTES:-0}"
 
 if [[ ! -d "$SRC_CORPUS" ]]; then
   echo "Source corpus not found at $SRC_CORPUS — set SRC_CORPUS=<path>." >&2
@@ -85,18 +100,29 @@ mkdir -p "$XDG_CONFIG_HOME" "$XDG_DATA_HOME"
 echo "Indexing WITH copy ($WITH_DIR) — global mode KB under \$XDG_DATA_HOME…"
 "$BIN" init --source "$WITH_DIR" --mode global --ingest
 
-# Render the WITH mcp-config template into the bench dir.
+# Render the WITH mcp-config template into the bench dir with the
+# current gateway knobs. Re-render at bench time by re-running this
+# script with different PROFILE / STRIP / MAX_TOOL_RESULT_BYTES env
+# vars — re-render is cheap (the source corpus copy is the slow step).
 sed -e "s|@@BIN@@|$BIN|" \
     -e "s|@@WITH_DIR@@|$WITH_DIR|" \
+    -e "s|@@PROFILE@@|$PROFILE|" \
+    -e "s|@@STRIP@@|$STRIP|" \
+    -e "s|@@MAX_TOOL_RESULT_BYTES@@|$MAX_TOOL_RESULT_BYTES|" \
   "$(dirname "$0")/mcp-on.json.tmpl" > "$BENCH_DIR/mcp-on.json"
 
 cat <<EOF
 
 Setup complete.
 
-  WITH_DIR    = $WITH_DIR
-  WITHOUT_DIR = $WITHOUT_DIR
-  mcp-on.json = $BENCH_DIR/mcp-on.json
+  CORPUS                 = $CORPUS
+  SRC_CORPUS             = $SRC_CORPUS
+  WITH_DIR               = $WITH_DIR
+  WITHOUT_DIR            = $WITHOUT_DIR
+  mcp-on.json            = $BENCH_DIR/mcp-on.json
+  PROFILE                = $PROFILE
+  STRIP                  = $STRIP
+  MAX_TOOL_RESULT_BYTES  = $MAX_TOOL_RESULT_BYTES
 
 Next:
 

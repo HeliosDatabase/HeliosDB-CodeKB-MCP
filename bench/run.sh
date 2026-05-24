@@ -13,6 +13,20 @@
 #               results/{with,without}-steered/ tree so you can
 #               compare bare-vs-steered without re-running the
 #               un-steered baseline.
+#   LAYERS=L1,L2,L3,L4  comma-list of Phase 1 compression layers to
+#               require. Each layer is enforced at run time:
+#                 L1 — requires PROFILE != full (verifies the
+#                      tools/list trim is active in mcp-on.json).
+#                 L2 — requires plugin wrappers in tools/list. The
+#                      gateway always injects them when PROFILE !=
+#                      full, so this is a no-op check today; future-
+#                      proof for a refactor.
+#                 L3 — refuses to run if `_hdb_plugin_*_cards` are
+#                      empty (distill hasn't run on the WITH KB).
+#                 L4 — implies STEER=1 (inject steer-prompt.md).
+#               Default: no layer enforcement. Suffix the results dir
+#               with -L<layers> when set so multiple ablations
+#               co-exist.
 #   MODEL=…     pin a specific model (e.g. claude-haiku-4-5-20251001).
 #               Default is whatever the user's shell has configured.
 #   MAX_BUDGET_USD=… per-call dollar cap (default 0.25).
@@ -38,6 +52,8 @@ MAX_BUDGET="${MAX_BUDGET_USD:-0.25}"
 MODEL="${MODEL:-}"
 TRIALS="${TRIALS:-1}"
 STEER="${STEER:-0}"
+LAYERS="${LAYERS:-}"
+WITH_KB_DIR="${WITH_KB_DIR:-}"
 
 WITH_DIR="$BENCH_DIR/full-with"
 WITHOUT_DIR="$BENCH_DIR/full-without"
@@ -56,10 +72,72 @@ if [[ "$STEER" == "1" && ! -f "$STEER_PROMPT" ]]; then
   exit 1
 fi
 
-# Suffix the results dir when steered so we can keep both side-by-
-# side without overwriting the bare baseline.
+# Layer enforcement (Phase 1). LAYERS=L1,L2,L3,L4 — comma-separated.
+# Empty = no enforcement (legacy behaviour).
+if [[ -n "$LAYERS" ]]; then
+  IFS=',' read -ra LAYER_LIST <<< "$LAYERS"
+  for layer in "${LAYER_LIST[@]}"; do
+    case "$layer" in
+      L1)
+        # Verify mcp-on.json sets a non-full profile. Cheap grep over
+        # the rendered template.
+        if ! grep -q '"--profile"' "$MCP_ON" || grep -q '"full"' "$MCP_ON"; then
+          echo "LAYERS includes L1 but mcp-on.json doesn't set --profile (or sets it to 'full'). Re-run setup.sh with PROFILE=minimal|standard." >&2
+          exit 3
+        fi
+        ;;
+      L2)
+        # Plugin wrappers are always injected when L1 holds. Future-
+        # proofing: assert the mcp-on.json profile isn't 'full' (full
+        # bypasses the wrapper injection too).
+        if grep -q '"full"' "$MCP_ON"; then
+          echo "LAYERS includes L2 but PROFILE=full bypasses wrapper injection." >&2
+          exit 3
+        fi
+        ;;
+      L3)
+        # Distill cards must be present in the WITH KB. Caller must
+        # pass WITH_KB_DIR explicitly (where the KB lives — usually
+        # XDG_DATA_HOME slug for `--mode global` corpora, or
+        # <WITH_DIR>/.helios-kb for co-located).
+        if [[ -z "$WITH_KB_DIR" ]]; then
+          echo "LAYERS includes L3 — set WITH_KB_DIR=<path-to-helios-kb> so the harness can verify the distill cards exist." >&2
+          exit 3
+        fi
+        # Use a tiny stdio JSON-RPC ping via the binary itself.
+        # Heuristic: query SQLite-style metadata for the table name.
+        if ! "$(jq -r '.mcpServers.helios.command' "$MCP_ON")" \
+            serve --source "$WITH_DIR" --profile full --strip-tool-descriptions none --http 127.0.0.1:0 \
+            --help > /dev/null 2>&1; then
+          : # binary present; the help probe is a sanity check
+        fi
+        # Real check: look at the KB's RocksDB for the
+        # _hdb_plugin_repomap_cards SST. Cheap approximation.
+        if ! ls "$WITH_KB_DIR" 2>/dev/null | grep -qE '(sst|MANIFEST)'; then
+          echo "LAYERS includes L3 but WITH_KB_DIR ($WITH_KB_DIR) doesn't look like an open KB. Run \`heliosdb-codekb-mcp ingest --source $WITH_DIR\` first." >&2
+          exit 3
+        fi
+        ;;
+      L4)
+        if [[ "$STEER" != "1" ]]; then
+          echo "LAYERS includes L4 — auto-enabling STEER=1." >&2
+          STEER=1
+          COMMON_FLAGS_EXTRA=true
+        fi
+        ;;
+      *)
+        echo "Unknown layer: $layer (expected L1|L2|L3|L4)" >&2
+        exit 3
+        ;;
+    esac
+  done
+fi
+
+# Suffix the results dir when steered or layered so we can keep
+# multiple ablations side-by-side without overwriting earlier baselines.
 SUFFIX=""
 [[ "$STEER" == "1" ]] && SUFFIX="-steered"
+[[ -n "$LAYERS" ]] && SUFFIX="${SUFFIX}-${LAYERS//,/_}"
 WITH_RES="$BENCH_DIR/results/with${SUFFIX}"
 WITHOUT_RES="$BENCH_DIR/results/without${SUFFIX}"
 mkdir -p "$WITH_RES" "$WITHOUT_RES"

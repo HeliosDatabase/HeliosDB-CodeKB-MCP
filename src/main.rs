@@ -30,11 +30,13 @@ use heliosdb_nano::EmbeddedDatabase;
 
 mod checkpoint;
 mod config;
+mod distill;
 mod ingest;
 mod kb;
 mod linker;
 mod mcp_trim;
 mod quality;
+mod wrappers;
 
 use config::Config;
 use ingest::{ingest as run_ingest, open_kb_for_ingest, IngestOptions};
@@ -76,8 +78,8 @@ enum Commands {
         /// (UTF-8 char-boundary safe). Larger strings get an
         /// `…[+N bytes truncated]` marker so the agent knows what was
         /// dropped. `0` disables trimming (the engine's full response
-        /// passes through unchanged). Currently only honoured on the
-        /// stdio transport; HTTP path always passes through.
+        /// passes through unchanged). Honoured on both stdio and HTTP
+        /// transports.
         ///
         /// Why this exists: `helios_lsp_*` and `helios_graphrag_search`
         /// return neighbouring-symbol bodies and full doc-section text
@@ -86,6 +88,28 @@ enum Commands {
         /// this flag.
         #[arg(long, value_name = "N", default_value_t = 0)]
         max_tool_result_bytes: usize,
+
+        /// MCP tool-surface profile: `minimal` | `standard` | `full`.
+        /// Filters which tools appear in `tools/list` responses to
+        /// shrink the per-turn cache cost (~96 k tokens dominated by
+        /// tool descriptions on Haiku; `bench/README.md`). The
+        /// dispatch path is unchanged — every `tools/call` still
+        /// reaches the engine regardless of profile.
+        ///
+        /// Falls back to `[serve] profile` in the config TOML if not
+        /// passed, then to `standard`.
+        #[arg(long, value_name = "PROFILE")]
+        profile: Option<String>,
+
+        /// How much of each tool's `description` to keep in the
+        /// advertised `tools/list` payload. Accepts: an integer (cap
+        /// at N bytes, no marker), `none` (pass through), or `all`
+        /// (drop entirely — violates strict MCP spec).
+        ///
+        /// Falls back to `[serve] strip_tool_descriptions` in the
+        /// config TOML if not passed, then to `200`.
+        #[arg(long, value_name = "MODE")]
+        strip_tool_descriptions: Option<String>,
     },
 
     /// Create / configure a KB for a source path. Persists the choice
@@ -144,6 +168,29 @@ enum Commands {
         /// `status --source <PWD>`.
         #[arg(long, default_value_t = false)]
         background_quality: bool,
+
+        /// Phase 2 LLM distillation: after the heuristic pass, send
+        /// each symbol (signature + body excerpt) to an OpenAI-
+        /// compatible chat endpoint for a 1-sentence summary stored
+        /// in `_hdb_plugin_symbol_cards.llm_summary`. Typical
+        /// deployment: a self-hosted Ollama (or vLLM) endpoint
+        /// reachable over Tailscale.
+        #[arg(long, default_value_t = false)]
+        with_llm_distill: bool,
+        /// OpenAI-compatible chat endpoint (no trailing slash). Used
+        /// only with `--with-llm-distill`.
+        #[arg(long, default_value = "http://ollama:11434")]
+        llm_distill_endpoint: String,
+        /// Model tag at the endpoint.
+        #[arg(long, default_value = "qwen3-coder:30b")]
+        llm_distill_model: String,
+        /// Number of in-flight Ollama requests.
+        #[arg(long, default_value_t = 4)]
+        llm_distill_concurrency: usize,
+        /// Cap symbols distilled this run (0 = no cap). Useful for
+        /// incremental rollout on a 100k+ symbol corpus.
+        #[arg(long, default_value_t = 0)]
+        llm_distill_max_symbols: usize,
     },
 
     /// Walk the source tree, classify and upsert files, run the
@@ -187,6 +234,18 @@ enum Commands {
         /// `status --source <PWD>`.
         #[arg(long, default_value_t = false)]
         background_quality: bool,
+
+        /// Phase 2 LLM distillation: see `Init --with-llm-distill`.
+        #[arg(long, default_value_t = false)]
+        with_llm_distill: bool,
+        #[arg(long, default_value = "http://ollama:11434")]
+        llm_distill_endpoint: String,
+        #[arg(long, default_value = "qwen3-coder:30b")]
+        llm_distill_model: String,
+        #[arg(long, default_value_t = 4)]
+        llm_distill_concurrency: usize,
+        #[arg(long, default_value_t = 0)]
+        llm_distill_max_symbols: usize,
     },
 
     /// Show config and per-KB stats. No `--source` ⇒ global summary.
@@ -239,7 +298,18 @@ async fn main() -> Result<()> {
             source,
             http,
             max_tool_result_bytes,
-        } => serve(&source, http.as_deref(), max_tool_result_bytes).await,
+            profile,
+            strip_tool_descriptions,
+        } => {
+            serve(
+                &source,
+                http.as_deref(),
+                max_tool_result_bytes,
+                profile.as_deref(),
+                strip_tool_descriptions.as_deref(),
+            )
+            .await
+        }
         Commands::Init {
             source,
             mode,
@@ -250,6 +320,11 @@ async fn main() -> Result<()> {
             durable_writes,
             with_embeddings,
             background_quality,
+            with_llm_distill,
+            llm_distill_endpoint,
+            llm_distill_model,
+            llm_distill_concurrency,
+            llm_distill_max_symbols,
         } => {
             let mode = KbMode::parse(&mode)?;
             init(&source, mode, kb.as_deref())?;
@@ -264,6 +339,13 @@ async fn main() -> Result<()> {
                     durable_writes,
                     with_embeddings,
                     background_quality,
+                    llm_distill: build_llm_distill_opts(
+                        with_llm_distill,
+                        &llm_distill_endpoint,
+                        &llm_distill_model,
+                        llm_distill_concurrency,
+                        llm_distill_max_symbols,
+                    ),
                 };
                 run_and_print_ingest(&opts)?;
             }
@@ -276,6 +358,11 @@ async fn main() -> Result<()> {
             durable_writes,
             with_embeddings,
             background_quality,
+            with_llm_distill,
+            llm_distill_endpoint,
+            llm_distill_model,
+            llm_distill_concurrency,
+            llm_distill_max_symbols,
         } => {
             let canonical_source = source.canonicalize()?;
             let kb_dir = lookup_kb_dir(&canonical_source)?;
@@ -287,6 +374,13 @@ async fn main() -> Result<()> {
                 durable_writes,
                 with_embeddings,
                 background_quality,
+                llm_distill: build_llm_distill_opts(
+                    with_llm_distill,
+                    &llm_distill_endpoint,
+                    &llm_distill_model,
+                    llm_distill_concurrency,
+                    llm_distill_max_symbols,
+                ),
             };
             run_and_print_ingest(&opts)
         }
@@ -313,10 +407,34 @@ async fn main() -> Result<()> {
     }
 }
 
+/// Translate the four `--llm-distill-*` CLI flags into the engine
+/// options struct. `None` when LLM distillation is off.
+fn build_llm_distill_opts(
+    enabled: bool,
+    endpoint: &str,
+    model: &str,
+    concurrency: usize,
+    max_symbols: usize,
+) -> Option<distill::LlmDistillOptions> {
+    if !enabled {
+        return None;
+    }
+    Some(distill::LlmDistillOptions {
+        endpoint: endpoint.to_string(),
+        model: model.to_string(),
+        max_tokens: 80,
+        timeout_secs: 60,
+        concurrency: concurrency.max(1),
+        max_symbols,
+    })
+}
+
 async fn serve(
     source: &std::path::Path,
     http: Option<&str>,
     max_tool_result_bytes: usize,
+    cli_profile: Option<&str>,
+    cli_strip: Option<&str>,
 ) -> Result<()> {
     let cfg = Config::load_or_default()?;
     let spec = cfg
@@ -327,7 +445,19 @@ async fn serve(
             source.display(),
         ))?;
 
-    tracing::info!(kb = %spec.kb_dir.display(), "opening KB");
+    // Resolve gateway config: CLI flag → config TOML → built-in default.
+    let profile_str = cli_profile
+        .map(str::to_string)
+        .or_else(|| cfg.serve.profile.clone())
+        .unwrap_or_else(|| "standard".to_string());
+    let strip_str = cli_strip
+        .map(str::to_string)
+        .or_else(|| cfg.serve.strip_tool_descriptions.clone())
+        .unwrap_or_else(|| "200".to_string());
+    let profile = mcp_trim::Profile::parse(&profile_str).map_err(|e| anyhow::anyhow!(e))?;
+    let strip_desc = mcp_trim::StripDescMode::parse(&strip_str).map_err(|e| anyhow::anyhow!(e))?;
+
+    tracing::info!(kb = %spec.kb_dir.display(), profile = profile.as_str(), "opening KB");
     let db = Arc::new(EmbeddedDatabase::new(&spec.kb_dir).with_context(|| {
         format!(
             "failed to open EmbeddedDatabase at {}",
@@ -335,10 +465,18 @@ async fn serve(
         )
     })?);
 
+    let gateway_cfg = GatewayCfg {
+        profile,
+        strip_desc,
+        max_tool_result_bytes,
+    };
+
     match http {
         None => {
-            if max_tool_result_bytes == 0 {
-                tracing::info!("starting MCP stdio server (engine loop, no trimming)");
+            // Pass-through fast path: no filtering, no shortening, no
+            // result trimming → use the engine's loop unchanged.
+            if gateway_cfg.is_passthrough() {
+                tracing::info!("starting MCP stdio server (engine loop, no gateway rewrite)");
                 let mut server = heliosdb_nano::mcp::McpServer::new(db);
                 server
                     .run()
@@ -346,20 +484,14 @@ async fn serve(
                     .map_err(|e| anyhow::anyhow!("MCP server failed: {e}"))
             } else {
                 tracing::info!(
+                    profile = gateway_cfg.profile.as_str(),
                     cap = max_tool_result_bytes,
-                    "starting MCP stdio server (plugin loop with tool-result trimming)"
+                    "starting MCP stdio server (plugin gateway loop)"
                 );
-                stdio_loop_with_trim(db.as_ref(), max_tool_result_bytes).await
+                stdio_loop_with_gateway(db.as_ref(), &gateway_cfg).await
             }
         }
         Some(addr) => {
-            // Bind axum's MCP router on the requested address.  The
-            // engine's `mcp_router` carries every transport variant
-            // (POST `/`, GET `/ws`, GET `/sse`, GET `/info`) on a
-            // single `Router<()>`, so we just hand it a fresh
-            // `McpState` and call `axum::serve`.
-            let state = heliosdb_nano::mcp::McpState::new(db);
-            let app = heliosdb_nano::mcp::mcp_router(state);
             let listener = tokio::net::TcpListener::bind(addr)
                 .await
                 .with_context(|| format!("bind MCP HTTP listener on {addr}"))?;
@@ -368,17 +500,20 @@ async fn serve(
                 .map(|a| a.to_string())
                 .unwrap_or_else(|_| addr.to_string());
             eprintln!("MCP HTTP server listening on http://{bound}");
-            eprintln!("  POST /         JSON-RPC 2.0");
-            eprintln!("  GET  /ws       WebSocket upgrade");
-            eprintln!("  GET  /sse      server-sent events");
-            eprintln!("  GET  /info     discovery + cache stats");
-            tracing::info!(%bound, "starting MCP HTTP server");
-            // Graceful shutdown on Ctrl-C / SIGTERM so a kill from
-            // the agent harness doesn't strand RocksDB locks.
+            eprintln!("  POST /         JSON-RPC 2.0 (plugin gateway)");
+            eprintln!("  GET  /ws       WebSocket upgrade (engine, pass-through)");
+            eprintln!("  GET  /sse      server-sent events (engine, pass-through)");
+            eprintln!("  GET  /info     discovery + cache stats (engine, pass-through)");
+            tracing::info!(
+                %bound,
+                profile = gateway_cfg.profile.as_str(),
+                "starting MCP HTTP server"
+            );
             let shutdown = async {
                 let _ = tokio::signal::ctrl_c().await;
                 tracing::info!("MCP HTTP server received Ctrl-C, shutting down");
             };
+            let app = build_http_gateway_router(db, gateway_cfg);
             axum::serve(listener, app)
                 .with_graceful_shutdown(shutdown)
                 .await
@@ -387,22 +522,181 @@ async fn serve(
     }
 }
 
+/// Per-serve gateway config. Cheap to clone (`Copy` on the inner enums,
+/// plain `usize`) — fits in a tower `Extension`.
+#[derive(Clone, Copy)]
+struct GatewayCfg {
+    profile: mcp_trim::Profile,
+    strip_desc: mcp_trim::StripDescMode,
+    max_tool_result_bytes: usize,
+}
+
+impl GatewayCfg {
+    /// `true` when no rewrites are needed AND the plugin has no
+    /// wrappers to inject — the engine's loop / router can serve
+    /// directly. Layer 2 added the plugin-wrapper tools, so the
+    /// passthrough path is now narrower: only `Profile::Full` with no
+    /// stripping AND no body cap qualifies, AND we never expose
+    /// wrappers under Full (Full means "engine surface as-is"). Since
+    /// `Profile::Full` returns `true` for *every* tool name, the
+    /// wrapper tools ARE allowed under it — but we still don't inject
+    /// them in the passthrough branch because the engine doesn't
+    /// implement their dispatch. So this check stays exactly the same;
+    /// the passthrough path runs only when the user opted into
+    /// engine-native behaviour.
+    fn is_passthrough(&self) -> bool {
+        self.profile == mcp_trim::Profile::Full
+            && matches!(self.strip_desc, mcp_trim::StripDescMode::None)
+            && self.max_tool_result_bytes == 0
+    }
+}
+
+/// Apply the gateway's wire-level rewrites to a serialized JSON-RPC
+/// response based on the original request method. Used by both
+/// transports so they stay in lockstep.
+///
+/// Order for `tools/list`: engine → inject plugin wrappers → profile
+/// filter + description strip. Injection comes BEFORE filtering so
+/// the profile's allow list applies symmetrically to plugin and
+/// engine tools.
+fn apply_gateway_rewrite(json: &str, method: &str, cfg: &GatewayCfg) -> String {
+    match method {
+        "tools/list" => {
+            let with_wrappers = wrappers::inject_into_tools_list(json, cfg.profile);
+            mcp_trim::trim_tools_list_wire(&with_wrappers, cfg.profile, cfg.strip_desc)
+        }
+        "tools/call" if cfg.max_tool_result_bytes > 0 => {
+            mcp_trim::trim_rpc_response_wire(json, cfg.max_tool_result_bytes)
+        }
+        _ => json.to_string(),
+    }
+}
+
+/// Extract `params.name` from a `tools/call` request so the dispatch
+/// layer can short-circuit to a plugin wrapper before the engine
+/// runs. Returns `None` for missing / non-string `name`.
+fn tools_call_name(params: &serde_json::Value) -> Option<&str> {
+    params.get("name").and_then(|v| v.as_str())
+}
+
+/// Build a JSON-RPC `result` envelope for a successful plugin
+/// dispatch, mirroring the engine's `RpcResponse::success` shape.
+fn plugin_success_response(id: serde_json::Value, value: serde_json::Value) -> String {
+    let envelope = wrappers::wrap_call_result(value);
+    serde_json::to_string(&serde_json::json!({
+        "jsonrpc": "2.0",
+        "id": id,
+        "result": envelope,
+    }))
+    .unwrap_or_else(|_| String::new())
+}
+
+/// Build a JSON-RPC `result` envelope marked `isError: true` for a
+/// plugin handler's user-facing failure. Note: this is NOT the
+/// JSON-RPC error frame (`-32xxx` codes) — MCP carries handler
+/// failures inside `result.isError`, leaving the JSON-RPC error
+/// frame for protocol-level problems.
+fn plugin_handler_error_response(id: serde_json::Value, msg: String) -> String {
+    let envelope = wrappers::wrap_call_error(msg);
+    serde_json::to_string(&serde_json::json!({
+        "jsonrpc": "2.0",
+        "id": id,
+        "result": envelope,
+    }))
+    .unwrap_or_else(|_| String::new())
+}
+
+/// Build an axum `Router<()>` that mirrors the engine's `mcp_router`
+/// shape but interposes our gateway on `POST /`. The streaming
+/// transports (`/ws`, `/sse`) and discovery (`/info`) are mounted
+/// straight from the engine — buffering them would break the stream.
+fn build_http_gateway_router(
+    db: Arc<EmbeddedDatabase>,
+    cfg: GatewayCfg,
+) -> axum::Router {
+    use axum::extract::{Extension, State};
+    use axum::response::IntoResponse;
+    use axum::routing::{get, post};
+    use axum::Json;
+    use heliosdb_nano::mcp::axum_routes::{handle_info, handle_sse, handle_ws_upgrade};
+    use heliosdb_nano::mcp::rpc::{handle_rpc_with_db, RpcRequest};
+    use heliosdb_nano::mcp::McpState;
+
+    async fn gateway_post(
+        State(state): State<McpState>,
+        Extension(cfg): Extension<GatewayCfg>,
+        Json(req): Json<RpcRequest>,
+    ) -> impl IntoResponse {
+        let method = req.method.clone();
+        let id = req.id.clone().unwrap_or(serde_json::Value::Null);
+
+        let out = if method == "tools/call" {
+            if let Some(name) = tools_call_name(&req.params) {
+                if let Some(result) = wrappers::dispatch(
+                    state.db.as_ref(),
+                    name,
+                    req.params.get("arguments").unwrap_or(&serde_json::Value::Null),
+                ) {
+                    match result {
+                        Ok(v) => plugin_success_response(id, v),
+                        Err(msg) => plugin_handler_error_response(id, msg),
+                    }
+                } else {
+                    let resp = handle_rpc_with_db(state.db.as_ref(), req);
+                    let json = serde_json::to_string(&resp).unwrap_or_default();
+                    apply_gateway_rewrite(&json, &method, &cfg)
+                }
+            } else {
+                let resp = handle_rpc_with_db(state.db.as_ref(), req);
+                let json = serde_json::to_string(&resp).unwrap_or_default();
+                apply_gateway_rewrite(&json, &method, &cfg)
+            }
+        } else {
+            let resp = handle_rpc_with_db(state.db.as_ref(), req);
+            let json = serde_json::to_string(&resp).unwrap_or_default();
+            apply_gateway_rewrite(&json, &method, &cfg)
+        };
+
+        (
+            axum::http::StatusCode::OK,
+            [(axum::http::header::CONTENT_TYPE, "application/json")],
+            out,
+        )
+            .into_response()
+    }
+
+    let state = McpState::new(db);
+    axum::Router::new()
+        .route("/", post(gateway_post))
+        .route("/ws", get(handle_ws_upgrade))
+        .route("/sse", get(handle_sse))
+        .route("/info", get(handle_info))
+        .layer(Extension(cfg))
+        .with_state(state)
+}
+
 /// Custom JSON-RPC stdio loop that mirrors `heliosdb_nano::mcp::McpServer::run`
 /// but post-processes every response through `crate::mcp_trim` before
-/// writing it to stdout. Used when the user passes `--max-tool-result-bytes
-/// <N>` to trim oversized tool result bodies for token savings.
+/// writing it to stdout. Used whenever the user has asked for any
+/// gateway-level rewrite — profile filtering, description shortening,
+/// or per-call result-body trimming.
 ///
 /// Caveats vs the engine's loop:
 ///
 /// * No streaming-progress dispatch (the engine's loop has a special
 ///   path for `tools/call` with `_meta.progressToken` that emits
 ///   `notifications/progress` mid-call). The bench workload doesn't
-///   use progress tokens, and the trim mode is opt-in, so we keep the
-///   simple variant. If a request includes a progressToken we still
-///   serve it — just synchronously, with the trim applied to the
-///   final response (no per-chunk streaming notifications).
+///   use progress tokens, and the gateway mode is opt-out (the
+///   `GatewayCfg::is_passthrough()` branch in `serve()` keeps the
+///   engine's loop when no rewrites are needed). If a request
+///   includes a progressToken we still serve it — just synchronously,
+///   with the rewrite applied to the final response (no per-chunk
+///   streaming notifications).
 /// * `initialized` notifications are no-ops, same as the engine.
-async fn stdio_loop_with_trim(db: &heliosdb_nano::EmbeddedDatabase, max_bytes: usize) -> Result<()> {
+async fn stdio_loop_with_gateway(
+    db: &heliosdb_nano::EmbeddedDatabase,
+    cfg: &GatewayCfg,
+) -> Result<()> {
     use heliosdb_nano::mcp::rpc::{handle_rpc_with_db, RpcRequest, RpcResponse};
     use std::io::{BufRead, BufReader, Write};
 
@@ -444,22 +738,38 @@ async fn stdio_loop_with_trim(db: &heliosdb_nano::EmbeddedDatabase, max_bytes: u
             continue;
         }
 
-        let is_tools_call = req.method == "tools/call";
-        let resp: RpcResponse = handle_rpc_with_db(db, req);
-        let json = match serde_json::to_string(&resp) {
-            Ok(j) => j,
-            Err(e) => {
-                tracing::error!(error = %e, "response serialize failed");
-                continue;
-            }
-        };
+        let method = req.method.clone();
+        let id = req.id.clone().unwrap_or(serde_json::Value::Null);
 
-        // Trim only `tools/call` responses — schemas / discovery /
-        // resources stay intact.
-        let out_line = if is_tools_call {
-            crate::mcp_trim::trim_rpc_response_wire(&json, max_bytes)
+        // Plugin-wrapper short-circuit: if this is a tools/call for a
+        // wrapper name, dispatch in-process and skip the engine.
+        let out_line = if method == "tools/call" {
+            if let Some(name) = tools_call_name(&req.params) {
+                if let Some(result) = wrappers::dispatch(db, name, req.params.get("arguments").unwrap_or(&serde_json::Value::Null)) {
+                    match result {
+                        Ok(v) => plugin_success_response(id, v),
+                        Err(msg) => plugin_handler_error_response(id, msg),
+                    }
+                } else {
+                    let resp: RpcResponse = handle_rpc_with_db(db, req);
+                    let json = serde_json::to_string(&resp).unwrap_or_default();
+                    apply_gateway_rewrite(&json, &method, cfg)
+                }
+            } else {
+                let resp: RpcResponse = handle_rpc_with_db(db, req);
+                let json = serde_json::to_string(&resp).unwrap_or_default();
+                apply_gateway_rewrite(&json, &method, cfg)
+            }
         } else {
-            json
+            let resp: RpcResponse = handle_rpc_with_db(db, req);
+            let json = match serde_json::to_string(&resp) {
+                Ok(j) => j,
+                Err(e) => {
+                    tracing::error!(error = %e, "response serialize failed");
+                    continue;
+                }
+            };
+            apply_gateway_rewrite(&json, &method, cfg)
         };
 
         writeln!(stdout, "{}", out_line)

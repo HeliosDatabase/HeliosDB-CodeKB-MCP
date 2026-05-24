@@ -5,7 +5,9 @@
       "args": [
         "serve",
         "--source", "@@WITH_DIR@@",
-        "--max-tool-result-bytes", "800"
+        "--profile", "@@PROFILE@@",
+        "--strip-tool-descriptions", "@@STRIP@@",
+        "--max-tool-result-bytes", "@@MAX_TOOL_RESULT_BYTES@@"
       ]
     }
   }
