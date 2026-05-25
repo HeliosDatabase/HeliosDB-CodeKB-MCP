@@ -122,6 +122,14 @@ enum Commands {
         /// modes and pick per project.
         #[arg(long, default_value_t = false)]
         mega_tool: bool,
+
+        /// Per-process LRU cache of wrapper-tool results. Repeated
+        /// `(tool_name, args)` lookups within a single serve session
+        /// short-circuit past the engine. `0` disables (default — no
+        /// memory cost, no behavioural surprise). 64-256 is a good
+        /// starting point for an interactive agent session.
+        #[arg(long, default_value_t = 0)]
+        wrapper_cache_size: usize,
     },
 
     /// Create / configure a KB for a source path. Persists the choice
@@ -203,6 +211,12 @@ enum Commands {
         /// incremental rollout on a 100k+ symbol corpus.
         #[arg(long, default_value_t = 0)]
         llm_distill_max_symbols: usize,
+        /// Symbols per chat call. 1 = one request per symbol
+        /// (slow); 8-10 amortises model-load overhead on Qwen3-coder.
+        /// Cuts Phase 2 wall time ~`batch_size`× at the cost of
+        /// slightly longer per-batch responses.
+        #[arg(long, default_value_t = 8)]
+        llm_distill_batch_size: usize,
     },
 
     /// Walk the source tree, classify and upsert files, run the
@@ -258,6 +272,8 @@ enum Commands {
         llm_distill_concurrency: usize,
         #[arg(long, default_value_t = 0)]
         llm_distill_max_symbols: usize,
+        #[arg(long, default_value_t = 8)]
+        llm_distill_batch_size: usize,
     },
 
     /// Show config and per-KB stats. No `--source` ⇒ global summary.
@@ -313,7 +329,9 @@ async fn main() -> Result<()> {
             profile,
             strip_tool_descriptions,
             mega_tool,
+            wrapper_cache_size,
         } => {
+            wrappers::set_cache_capacity(wrapper_cache_size);
             serve(
                 &source,
                 http.as_deref(),
@@ -339,6 +357,7 @@ async fn main() -> Result<()> {
             llm_distill_model,
             llm_distill_concurrency,
             llm_distill_max_symbols,
+            llm_distill_batch_size,
         } => {
             let mode = KbMode::parse(&mode)?;
             init(&source, mode, kb.as_deref())?;
@@ -359,6 +378,7 @@ async fn main() -> Result<()> {
                         &llm_distill_model,
                         llm_distill_concurrency,
                         llm_distill_max_symbols,
+                        llm_distill_batch_size,
                     ),
                 };
                 run_and_print_ingest(&opts)?;
@@ -377,6 +397,7 @@ async fn main() -> Result<()> {
             llm_distill_model,
             llm_distill_concurrency,
             llm_distill_max_symbols,
+            llm_distill_batch_size,
         } => {
             let canonical_source = source.canonicalize()?;
             let kb_dir = lookup_kb_dir(&canonical_source)?;
@@ -394,6 +415,7 @@ async fn main() -> Result<()> {
                     &llm_distill_model,
                     llm_distill_concurrency,
                     llm_distill_max_symbols,
+                    llm_distill_batch_size,
                 ),
             };
             run_and_print_ingest(&opts)
@@ -421,14 +443,15 @@ async fn main() -> Result<()> {
     }
 }
 
-/// Translate the four `--llm-distill-*` CLI flags into the engine
-/// options struct. `None` when LLM distillation is off.
+/// Translate the `--llm-distill-*` CLI flags into the engine options
+/// struct. `None` when LLM distillation is off.
 fn build_llm_distill_opts(
     enabled: bool,
     endpoint: &str,
     model: &str,
     concurrency: usize,
     max_symbols: usize,
+    batch_size: usize,
 ) -> Option<distill::LlmDistillOptions> {
     if !enabled {
         return None;
@@ -437,9 +460,10 @@ fn build_llm_distill_opts(
         endpoint: endpoint.to_string(),
         model: model.to_string(),
         max_tokens: 80,
-        timeout_secs: 60,
+        timeout_secs: 120,
         concurrency: concurrency.max(1),
         max_symbols,
+        batch_size: batch_size.max(1),
     })
 }
 
