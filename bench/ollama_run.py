@@ -79,6 +79,7 @@ WITHOUT_DIR = os.environ.get("WITHOUT_DIR")
 MCP_BIN = os.environ.get("MCP_BIN") or _find_mcp_binary()
 MCP_PROFILE = os.environ.get("MCP_PROFILE", "standard")
 MCP_STRIP = os.environ.get("MCP_STRIP", "200")
+MCP_MEGA = os.environ.get("MCP_MEGA", "0") == "1"
 TRIALS = int(os.environ.get("TRIALS", "1"))
 MAX_TURNS = int(os.environ.get("MAX_TURNS", "24"))
 MAX_TOOL_BYTES = int(os.environ.get("MAX_TOOL_BYTES", "4096"))
@@ -119,14 +120,17 @@ class McpStdioClient:
 
     def __init__(self, source_dir: str, profile: str = "standard", strip: str = "200"):
         assert MCP_BIN, "MCP_BIN unset — set MCP_BIN=<path-to-heliosdb-codekb-mcp>"
+        args = [
+            MCP_BIN,
+            "serve",
+            "--source", source_dir,
+            "--profile", profile,
+            "--strip-tool-descriptions", strip,
+        ]
+        if MCP_MEGA:
+            args.append("--mega-tool")
         self.proc = subprocess.Popen(
-            [
-                MCP_BIN,
-                "serve",
-                "--source", source_dir,
-                "--profile", profile,
-                "--strip-tool-descriptions", strip,
-            ],
+            args,
             stdin=subprocess.PIPE,
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,

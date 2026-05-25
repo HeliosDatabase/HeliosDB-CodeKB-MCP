@@ -562,11 +562,12 @@ pub fn ingest(db: &EmbeddedDatabase, opts: IngestOptions) -> Result<IngestSummar
                 }
             };
             eprintln!(
-                "ingest phase: distill done in {:.1} s — {} symbol cards ({} unchanged), \
+                "ingest phase: distill done in {:.1} s — {} symbol cards ({} unchanged, scanned {}), \
                  {} file cards (pagerank {} iters, converged={})",
                 distill_started.elapsed().as_secs_f64(),
                 sym_stats.symbols_written,
                 sym_stats.symbols_unchanged,
+                sym_stats.symbols_scanned,
                 repo_stats.files_written,
                 repo_stats.pagerank_iters,
                 repo_stats.pagerank_converged,
