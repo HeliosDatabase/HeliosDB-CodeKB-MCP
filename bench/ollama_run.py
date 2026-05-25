@@ -80,6 +80,11 @@ MCP_BIN = os.environ.get("MCP_BIN") or _find_mcp_binary()
 MCP_PROFILE = os.environ.get("MCP_PROFILE", "standard")
 MCP_STRIP = os.environ.get("MCP_STRIP", "200")
 MCP_MEGA = os.environ.get("MCP_MEGA", "0") == "1"
+STEER = os.environ.get("STEER", "0") == "1"
+STEER_PROMPT_PATH = Path(os.environ.get(
+    "STEER_PROMPT",
+    str(Path(__file__).parent / "steer-prompt.md"),
+))
 TRIALS = int(os.environ.get("TRIALS", "1"))
 MAX_TURNS = int(os.environ.get("MAX_TURNS", "24"))
 MAX_TOOL_BYTES = int(os.environ.get("MAX_TOOL_BYTES", "4096"))
@@ -316,7 +321,7 @@ def execute_without_tool(name: str, args: dict, root: str) -> str:
 # Agent loop
 # ---------------------------------------------------------------------------
 
-SYSTEM_PROMPT = (
+_BASE_SYSTEM_PROMPT = (
     "You are answering a developer's question about the code repository made "
     "available via the tools below. Use the tools to investigate, then return "
     "a concise final answer (3-6 sentences max). Do NOT call tools for things "
@@ -324,6 +329,23 @@ SYSTEM_PROMPT = (
     "When you need a tool, you MUST use the OpenAI tool_calls JSON format the "
     "API provides — do NOT emit `<function=…>` inline syntax in your message."
 )
+
+
+def _build_system_prompt() -> str:
+    """Optionally append the steer-prompt file (parity with the Claude bench's
+    --append-system-prompt-file flag). Same prompt is applied to both WITH and
+    WITHOUT setups so the comparison stays apples-to-apples."""
+    prompt = _BASE_SYSTEM_PROMPT
+    if STEER:
+        try:
+            steer = STEER_PROMPT_PATH.read_text()
+            prompt = prompt + "\n\n" + steer.strip()
+        except Exception as e:
+            print(f"WARN: STEER=1 but could not read {STEER_PROMPT_PATH}: {e}", file=sys.stderr)
+    return prompt
+
+
+SYSTEM_PROMPT = _build_system_prompt()
 
 # Qwen3-coder occasionally emits inline tool-call syntax instead of
 # the proper `tool_calls` field on the assistant message. This regex

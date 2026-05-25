@@ -101,7 +101,140 @@ pub fn dispatch(
     args: &JsonValue,
 ) -> Option<Result<JsonValue, String>> {
     let tool = PLUGIN_TOOLS.iter().find(|t| t.name == name)?;
-    Some((tool.handler)(db, args))
+    // Cache lookup — skip when capacity is 0 (the default). Repeats
+    // within a serve session short-circuit; cache evicts LRU when
+    // full. The `key` mixes tool name + canonical-JSON arg payload,
+    // so different field= selections / detail= levels each get their
+    // own slot.
+    if let Some(cached) = cache_get(name, args) {
+        return Some(Ok(cached));
+    }
+    let result = (tool.handler)(db, args);
+    if let Ok(ref v) = result {
+        cache_put(name, args, v);
+    }
+    Some(result)
+}
+
+// ---------------------------------------------------------------------------
+// Per-process LRU result cache (Tier A #4)
+// ---------------------------------------------------------------------------
+
+/// Tiny LRU keyed on `(tool_name, args_hash)`. Wrapper handlers are
+/// pure functions of their args — within a single serve session, the
+/// same `(name, args)` always returns the same value (the KB doesn't
+/// mutate during a serve), so we can short-circuit repeat lookups.
+///
+/// Capacity is set via `--wrapper-cache-size N` on the CLI (0 = off).
+/// Implementation is a `HashMap` + `VecDeque` over the FNV-1a hash of
+/// the canonicalised arg-JSON. Skip-when-size-0 keeps the perf hit to
+/// "one hash + one lock check" when the feature is off.
+pub struct WrapperCache {
+    cap: usize,
+    map: std::collections::HashMap<u64, serde_json::Value>,
+    order: std::collections::VecDeque<u64>,
+    pub hits: u64,
+    pub misses: u64,
+}
+
+impl WrapperCache {
+    fn new() -> Self {
+        Self {
+            cap: 0,
+            map: std::collections::HashMap::new(),
+            order: std::collections::VecDeque::new(),
+            hits: 0,
+            misses: 0,
+        }
+    }
+
+    fn key(name: &str, args: &JsonValue) -> u64 {
+        let mut h: u64 = 0xcbf29ce484222325;
+        for b in name.as_bytes() {
+            h ^= *b as u64;
+            h = h.wrapping_mul(0x100000001b3);
+        }
+        // canonicalise the args via serde_json's stable serialiser.
+        let canon = serde_json::to_string(args).unwrap_or_default();
+        for b in canon.as_bytes() {
+            h ^= *b as u64;
+            h = h.wrapping_mul(0x100000001b3);
+        }
+        h
+    }
+}
+
+static WRAPPER_CACHE: std::sync::OnceLock<std::sync::Mutex<WrapperCache>> =
+    std::sync::OnceLock::new();
+
+fn cache() -> &'static std::sync::Mutex<WrapperCache> {
+    WRAPPER_CACHE.get_or_init(|| std::sync::Mutex::new(WrapperCache::new()))
+}
+
+/// Set the cache capacity (0 = disabled). Called once during `serve`
+/// startup; later calls reset and resize.
+pub fn set_cache_capacity(cap: usize) {
+    let mut g = match cache().lock() {
+        Ok(g) => g,
+        Err(_) => return,
+    };
+    g.cap = cap;
+    g.map.clear();
+    g.order.clear();
+    g.hits = 0;
+    g.misses = 0;
+}
+
+fn cache_get(name: &str, args: &JsonValue) -> Option<JsonValue> {
+    let mut g = cache().lock().ok()?;
+    if g.cap == 0 {
+        return None;
+    }
+    let k = WrapperCache::key(name, args);
+    if let Some(v) = g.map.get(&k).cloned() {
+        // Bump to back (most recently used). Linear scan; cap is
+        // expected to be small (≤256), so this is cheap.
+        if let Some(pos) = g.order.iter().position(|&x| x == k) {
+            g.order.remove(pos);
+        }
+        g.order.push_back(k);
+        g.hits += 1;
+        return Some(v);
+    }
+    g.misses += 1;
+    None
+}
+
+fn cache_put(name: &str, args: &JsonValue, v: &JsonValue) {
+    let mut g = match cache().lock() {
+        Ok(g) => g,
+        Err(_) => return,
+    };
+    if g.cap == 0 {
+        return;
+    }
+    let k = WrapperCache::key(name, args);
+    if !g.map.contains_key(&k) {
+        while g.order.len() >= g.cap {
+            if let Some(old) = g.order.pop_front() {
+                g.map.remove(&old);
+            } else {
+                break;
+            }
+        }
+        g.order.push_back(k);
+    }
+    g.map.insert(k, v.clone());
+}
+
+/// Hits + misses for telemetry / status surfaces.
+#[allow(dead_code)]
+pub fn cache_stats() -> (u64, u64, usize, usize) {
+    let g = match cache().lock() {
+        Ok(g) => g,
+        Err(_) => return (0, 0, 0, 0),
+    };
+    (g.hits, g.misses, g.map.len(), g.cap)
 }
 
 // ---------------------------------------------------------------------------
@@ -327,6 +460,11 @@ fn repo_summary_schema() -> JsonValue {
                 "minimum": 1,
                 "maximum": 500,
                 "description": "Max files to return (by pagerank)."
+            },
+            "fields": {
+                "type": "array",
+                "items": { "type": "string" },
+                "description": "Optional projection on per-file cards. Choices: path, pagerank, top_symbols. Omit for all."
             }
         }
     })
@@ -394,7 +532,12 @@ fn symbol_card_schema() -> JsonValue {
                 "description": "Symbol name. Bare name (`new`) or qualified (`MyType::new`); the engine resolves."
             },
             "max_callers": { "type": "integer", "default": 5, "minimum": 0, "maximum": 50 },
-            "max_callees": { "type": "integer", "default": 5, "minimum": 0, "maximum": 50 }
+            "max_callees": { "type": "integer", "default": 5, "minimum": 0, "maximum": 50 },
+            "fields": {
+                "type": "array",
+                "items": { "type": "string" },
+                "description": "Optional projection — when set, only these fields are returned. Choices: qualified, signature, doc1l, llm_summary, file, line, callers, callees. Omit for all fields."
+            }
         }
     })
 }
@@ -421,6 +564,40 @@ fn arg_int_required(args: &JsonValue, key: &str) -> Result<i64, String> {
     args.get(key)
         .and_then(|v| v.as_i64())
         .ok_or_else(|| format!("missing required integer argument `{key}`"))
+}
+
+/// Read an optional `fields=["foo","bar"]` array. Returns `None` if
+/// absent or empty (caller emits all fields); otherwise a HashSet of
+/// the names to keep.
+fn arg_field_set(args: &JsonValue) -> Option<std::collections::HashSet<String>> {
+    let arr = args.get("fields")?.as_array()?;
+    if arr.is_empty() {
+        return None;
+    }
+    let set: std::collections::HashSet<String> = arr
+        .iter()
+        .filter_map(|v| v.as_str().map(str::to_string))
+        .collect();
+    if set.is_empty() {
+        None
+    } else {
+        Some(set)
+    }
+}
+
+/// Project a JSON object to the named subset. When `fields` is None
+/// the input passes through unchanged. Unknown field names in the
+/// set are simply absent from the output.
+fn project(v: JsonValue, fields: Option<&std::collections::HashSet<String>>) -> JsonValue {
+    let Some(fields) = fields else { return v; };
+    let Some(obj) = v.as_object() else { return v; };
+    let mut out = serde_json::Map::with_capacity(fields.len());
+    for (k, val) in obj {
+        if fields.contains(k) {
+            out.insert(k.clone(), val.clone());
+        }
+    }
+    JsonValue::Object(out)
 }
 
 /// Extract a string column from a Tuple row at `idx`. Returns "" for
@@ -465,6 +642,7 @@ fn table_exists(db: &EmbeddedDatabase, table: &str) -> bool {
 fn repo_summary_handler(db: &EmbeddedDatabase, args: &JsonValue) -> Result<JsonValue, String> {
     let detail = arg_str_opt(args, "detail").unwrap_or("file_index");
     let limit = arg_int(args, "limit", 50).clamp(1, 500);
+    let fields = arg_field_set(args);
 
     if !table_exists(db, "_hdb_plugin_repomap_cards") {
         return Ok(json!({
@@ -486,8 +664,8 @@ fn repo_summary_handler(db: &EmbeddedDatabase, args: &JsonValue) -> Result<JsonV
         let pagerank = tuple_f64(row, 1);
         let top_symbols_raw = tuple_str(row, 2);
 
-        match detail {
-            "minimal" => files.push(json!({ "path": path, "pagerank": pagerank })),
+        let full = match detail {
+            "minimal" => json!({ "path": path, "pagerank": pagerank }),
             "file_index" => {
                 let top: JsonValue = serde_json::from_str(&top_symbols_raw)
                     .unwrap_or(JsonValue::Array(vec![]));
@@ -504,24 +682,25 @@ fn repo_summary_handler(db: &EmbeddedDatabase, args: &JsonValue) -> Result<JsonV
                         .collect::<Vec<_>>(),
                     _ => vec![],
                 };
-                files.push(json!({
+                json!({
                     "path": path,
                     "pagerank": pagerank,
                     "top_symbols": trimmed,
-                }));
+                })
             }
             _ => {
                 // symbol_index: pass the cards through as stored
                 // (signature + doc1l per symbol).
                 let top: JsonValue = serde_json::from_str(&top_symbols_raw)
                     .unwrap_or(JsonValue::Array(vec![]));
-                files.push(json!({
+                json!({
                     "path": path,
                     "pagerank": pagerank,
                     "top_symbols": top,
-                }));
+                })
             }
-        }
+        };
+        files.push(project(full, fields.as_ref()));
     }
 
     Ok(json!({ "detail": detail, "count": files.len(), "files": files }))
@@ -841,7 +1020,7 @@ fn symbol_card_handler(db: &EmbeddedDatabase, args: &JsonValue) -> Result<JsonVa
         }
     }
 
-    Ok(json!({
+    let full = json!({
         "qualified": def.qualified,
         "signature": def.signature,
         "doc1l": doc1l,
@@ -850,7 +1029,8 @@ fn symbol_card_handler(db: &EmbeddedDatabase, args: &JsonValue) -> Result<JsonVa
         "line": def.line,
         "callers": callers,
         "callees": callees,
-    }))
+    });
+    Ok(project(full, arg_field_set(args).as_ref()))
 }
 
 // ---------------------------------------------------------------------------

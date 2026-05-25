@@ -746,9 +746,9 @@ pub struct LlmDistillOptions {
     pub endpoint: String,
     /// Model tag, e.g. `qwen3-coder:30b`.
     pub model: String,
-    /// Hard cap on summary tokens. Most code symbols summarise in ≤40
-    /// tokens; 80 leaves slack for verbose Qwen3 phrasings without
-    /// runaway costs.
+    /// Hard cap on summary tokens — applies PER SYMBOL inside a batch
+    /// (the per-batch budget is `max_tokens * batch_size`). Most
+    /// symbols summarise in ≤40 tokens; 80 leaves slack.
     pub max_tokens: u32,
     /// Optional per-call wall-time budget (seconds). 0 disables.
     pub timeout_secs: u64,
@@ -759,6 +759,10 @@ pub struct LlmDistillOptions {
     /// Useful for incremental rollout on a large corpus where you
     /// want to ship the first 5k summaries today and the rest later.
     pub max_symbols: usize,
+    /// Symbols per chat call. 1 = one prompt per symbol (slow). 8-10
+    /// is the sweet spot on Qwen3-coder:30b — amortises the model-load
+    /// overhead without bloating the prompt past ~2k tokens.
+    pub batch_size: usize,
 }
 
 impl Default for LlmDistillOptions {
@@ -767,9 +771,10 @@ impl Default for LlmDistillOptions {
             endpoint: "http://ollama:11434".to_string(),
             model: "qwen3-coder:30b".to_string(),
             max_tokens: 80,
-            timeout_secs: 60,
+            timeout_secs: 120,
             concurrency: 4,
             max_symbols: 0,
+            batch_size: 8,
         }
     }
 }
@@ -944,6 +949,12 @@ pub fn build_llm_summaries(
         content_hash: String,
         body_excerpt: String,
     }
+    impl SymbolPromptInput for Job {
+        fn qualified(&self) -> &str { &self.qualified }
+        fn signature(&self) -> &str { &self.signature }
+        fn doc1l(&self) -> &str { &self.doc1l }
+        fn body_excerpt(&self) -> &str { &self.body_excerpt }
+    }
 
     let mut jobs: Vec<Job> = Vec::with_capacity(rows.len());
     for snap in &rows {
@@ -990,10 +1001,11 @@ pub fn build_llm_summaries(
         return Ok(stats);
     }
 
-    // Worker pool: each thread pulls jobs off a shared queue, posts
-    // to Ollama, returns the (qualified, summary, prompt_tokens,
-    // completion_tokens) tuple. Errors return None and increment
-    // `failed`.
+    // Worker pool with batching: each thread pulls up to `batch_size`
+    // jobs at a time, sends them as one numbered chat prompt, parses
+    // the numbered output back to individual summaries. Cuts per-call
+    // model-load overhead by ~batch_size×.
+    let batch_size = opts.batch_size.max(1);
     let queue = Arc::new(Mutex::new(jobs.into_iter()));
     type WorkerResult = Option<(String, String, u64, u64)>;
     let mut handles = Vec::new();
@@ -1004,20 +1016,60 @@ pub fn build_llm_summaries(
         handles.push(thread::spawn(move || -> Vec<WorkerResult> {
             let mut out: Vec<WorkerResult> = Vec::new();
             loop {
-                let job = {
+                let batch: Vec<Job> = {
                     let mut q = match queue.lock() {
                         Ok(g) => g,
                         Err(_) => return out,
                     };
-                    q.next()
+                    let mut b = Vec::with_capacity(batch_size);
+                    for _ in 0..batch_size {
+                        match q.next() {
+                            Some(j) => b.push(j),
+                            None => break,
+                        }
+                    }
+                    b
                 };
-                let Some(job) = job else {
+                if batch.is_empty() {
                     return out;
-                };
-                let prompt = build_prompt(&job.qualified, &job.signature, &job.doc1l, &job.body_excerpt);
-                match call_ollama(&opts.endpoint, &opts.model, &prompt, opts.max_tokens, opts.timeout_secs) {
-                    Ok((summary, pt, ct)) => out.push(Some((job.qualified, summary, pt, ct))),
-                    Err(_) => out.push(None),
+                }
+                // Single-symbol fast path keeps the old prompt shape
+                // (helps when batch_size = 1 for debugging).
+                if batch.len() == 1 {
+                    let j = &batch[0];
+                    let prompt = build_prompt(&j.qualified, &j.signature, &j.doc1l, &j.body_excerpt);
+                    match call_ollama(&opts.endpoint, &opts.model, &prompt, opts.max_tokens, opts.timeout_secs) {
+                        Ok((s, pt, ct)) => out.push(Some((j.qualified.clone(), s, pt, ct))),
+                        Err(_) => out.push(None),
+                    }
+                    continue;
+                }
+                let prompt = build_batch_prompt(&batch);
+                // Per-batch token budget: per-symbol cap × batch size,
+                // plus 20 tokens of slack for numbering / newlines.
+                let budget = opts.max_tokens * batch.len() as u32 + 20;
+                match call_ollama(&opts.endpoint, &opts.model, &prompt, budget, opts.timeout_secs) {
+                    Ok((raw, pt, ct)) => {
+                        let summaries = parse_batch_output(&raw, batch.len());
+                        // Token accounting: split prompt + completion
+                        // tokens proportionally so the per-symbol stats
+                        // stay roughly comparable across batch sizes.
+                        let per_pt = pt / batch.len() as u64;
+                        let per_ct = ct / batch.len() as u64;
+                        for (i, j) in batch.into_iter().enumerate() {
+                            match summaries.get(i) {
+                                Some(s) if !s.trim().is_empty() => {
+                                    out.push(Some((j.qualified, s.clone(), per_pt, per_ct)))
+                                }
+                                _ => out.push(None),
+                            }
+                        }
+                    }
+                    Err(_) => {
+                        for _ in 0..batch.len() {
+                            out.push(None);
+                        }
+                    }
                 }
             }
         }));
@@ -1097,6 +1149,92 @@ fn build_prompt(qualified: &str, signature: &str, doc1l: &str, body: &str) -> St
         p.push_str(&cap);
     }
     p
+}
+
+/// Multi-symbol prompt — asks for N numbered single-sentence summaries
+/// in one round-trip. Body excerpts trimmed harder than single-symbol
+/// prompts so the total prompt stays under ~3-4k tokens per batch.
+fn build_batch_prompt(batch: &[impl SymbolPromptInput]) -> String {
+    let n = batch.len();
+    let mut p = format!(
+        "Summarise EACH of the following {n} code symbols in EXACTLY ONE sentence. \
+         Describe what each does at a high level — no parameter lists, no implementation notes. \
+         Reply with EXACTLY {n} numbered lines, each `N. <one sentence>` and nothing else.\n\n"
+    );
+    let per_body_cap = (3000 / n.max(1)).max(200);
+    for (i, sym) in batch.iter().enumerate() {
+        let _ = std::fmt::Write::write_fmt(
+            &mut p,
+            format_args!(
+                "{}. Symbol: {}\n   Signature: {}\n",
+                i + 1,
+                sym.qualified(),
+                sym.signature()
+            ),
+        );
+        let doc = sym.doc1l();
+        if !doc.is_empty() {
+            let _ = std::fmt::Write::write_fmt(
+                &mut p,
+                format_args!("   Existing one-line doc: {doc}\n"),
+            );
+        }
+        let body = sym.body_excerpt();
+        if !body.is_empty() {
+            let cap: String = body.chars().take(per_body_cap).collect();
+            let _ = std::fmt::Write::write_fmt(&mut p, format_args!("   Body:\n{}\n", cap));
+        }
+    }
+    p
+}
+
+/// Parse the model's `N. <sentence>` numbered output back into a
+/// Vec aligned with the input batch. Missing or malformed lines
+/// become empty strings (caller treats those as failures).
+fn parse_batch_output(raw: &str, expected: usize) -> Vec<String> {
+    let mut out = vec![String::new(); expected];
+    for line in raw.lines() {
+        let line = line.trim_start();
+        // Strip leading `N.` or `N)` numbering. Tolerate `**N.`,
+        // `[N]`, etc. by walking until we find a digit run.
+        let mut idx = 0usize;
+        let bytes = line.as_bytes();
+        while idx < bytes.len() && !bytes[idx].is_ascii_digit() {
+            idx += 1;
+        }
+        if idx >= bytes.len() {
+            continue;
+        }
+        let num_start = idx;
+        while idx < bytes.len() && bytes[idx].is_ascii_digit() {
+            idx += 1;
+        }
+        let n: usize = match line[num_start..idx].parse() {
+            Ok(v) => v,
+            Err(_) => continue,
+        };
+        // Skip the punctuation after the digits.
+        while idx < bytes.len() && matches!(bytes[idx], b'.' | b')' | b':' | b' ' | b'\t') {
+            idx += 1;
+        }
+        let rest = line[idx..].trim().trim_start_matches('*').trim();
+        if n == 0 || n > expected {
+            continue;
+        }
+        if out[n - 1].is_empty() {
+            out[n - 1] = rest.to_string();
+        }
+    }
+    out
+}
+
+/// Trait the batch prompt uses to read fields from each job entry.
+/// Implemented for `Job` below.
+trait SymbolPromptInput {
+    fn qualified(&self) -> &str;
+    fn signature(&self) -> &str;
+    fn doc1l(&self) -> &str;
+    fn body_excerpt(&self) -> &str;
 }
 
 fn call_ollama(
