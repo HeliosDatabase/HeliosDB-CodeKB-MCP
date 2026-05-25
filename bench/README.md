@@ -290,6 +290,34 @@ Corpus: this repository (`heliosdb-codekb-mcp` itself), 478 code symbols, 28 sou
 
 **Quality is preserved.** Spot-check on the biggest win (q02): both phases correctly identify `spawn_quality_child` as a detached-process launcher that survives TTY SIGHUP. Phase 2 reaches the answer in 2 turns vs 4 in Phase 1, because the LLM summary in the symbol card *is* the answer — the agent reads one card and stops investigating.
 
+### Phase 2 + `--mega-tool` (the breakthrough, 2026-05-25)
+
+Same Qwen3-coder, same smoke corpus, same 5 questions, same LLM-distilled Phase 2 KB. Server launched with `--mega-tool`: `tools/list` now returns ONE tool (`helios(action, args)`) at ~745 bytes vs ~5,689 bytes for `--profile standard --strip-tool-descriptions 200` (**−87% catalogue payload**). All engine + plugin tools are reachable as `action` sub-names; agent calls `helios(action="list_actions")` on demand to fetch the per-action schemas.
+
+| Q | with prompt | with completion | with turns | wall | no-MCP prompt | no-MCP completion | turns | wall | Δ total | vs Phase 2 plain |
+|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|
+| q01 | 21,543 | 846 | 11 | 14s | 3,027 | 269 | 3 | 3s | +19,093 | **−38% WITH cost** ✓ |
+| q02 | 7,115 | 576 | 7 | 7s | 38,425 | 664 | 11 | 11s | **−31,398** | +50% (variance; still wins by −31k vs no-MCP) |
+| q03 | 20,454 | 596 | 9 | 9s | 2,366 | 232 | 2 | 2s | +18,452 | **−38% WITH cost** ✓ |
+| q04 | 17,806 | 740 | 9 | 9s | 3,020 | 311 | 3 | 3s | +15,215 | **−61% WITH cost** ✓ |
+| q05 | 21,541 | 848 | 10 | 11s | 23,630 | 651 | 8 | 9s | -1,892 | **−45% WITH cost** ✓ |
+| **TOTAL** | **88,459** | **3,606** | — | **50s** | **70,468** | **2,127** | — | **28s** | **+19,470 (+26.8%)** | **WITH cost −43%** |
+
+**Two-step progression:**
+
+- Phase 1 (heuristic distill, standard profile): WITH 196,586 tokens, +107.5% overhead.
+- Phase 2 (LLM distill, standard profile): WITH 162,582 tokens, +158.0% overhead. WITH cost −17% (but no-MCP also dropped due to variance, so the % overhead got worse).
+- **Phase 2 + mega-tool: WITH 92,065 tokens, +26.8% overhead. WITH cost −43%** vs Phase 2 plain, −53% vs Phase 1.
+
+**What it buys us:** the mega-tool finally addresses the tool-surface floor identified as the structural barrier in the "what's missing to reach 80-90%" analysis. On this 28-file corpus the engine-tool descriptions were the dominant per-turn cache cost; collapsing them to one ~500-byte descriptor cut the WITH-MCP total by 43%.
+
+**What's left (toward 80-90% on a real-size corpus):**
+- Larger corpus (1-10 GB) where no-MCP scales linearly. The smoke corpus's 28 files cap the upside.
+- Multi-trial (TRIALS=3+) to suppress agent variance — q01 / q02 single-trial swings ±50%.
+- Engine FK validation slow path during ingest (capped this corpus at 28 min wall before we had to fall back); a real 1-10 GB bench depends on the engine fix landing.
+
+The mega-tool itself ships as opt-in `--mega-tool` so existing deployments don't change.
+
 **Why +107% / +158% overhead vs no-MCP, despite the 17% WITH-MCP improvement.** The smoke corpus is tiny (478 symbols, 28 files). The MCP `tools/list` payload is the floor — its cost doesn't shrink with corpus size, but no-MCP's `Read+Grep` cost grows linearly with corpus size. On a 1-10 GB corpus the no-MCP path scales linearly while the MCP path stays flat, so the same +17% Phase-2 win on the WITH side would flip the comparison: WITH-MCP wins outright. This matches the Haiku bench finding (line 158 above) — 80-90% savings unreachable at small scale.
 
 **Single-trial variance is the dominant uncertainty.** Qwen3-coder is deterministic at temperature=0, but tool-call selection can diverge based on cumulative context. Multi-trial measurement (TRIALS=3+) would tighten the bands. Q01's +75% regression in Phase 2 is the cleanest example of why.

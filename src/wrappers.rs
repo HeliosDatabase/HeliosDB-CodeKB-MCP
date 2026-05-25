@@ -104,6 +104,142 @@ pub fn dispatch(
     Some((tool.handler)(db, args))
 }
 
+// ---------------------------------------------------------------------------
+// Mega-tool — one helios(action, args) tool that covers every wrapper
+// ---------------------------------------------------------------------------
+
+/// Name of the mega-tool exposed when `--mega-tool` is active.
+pub const MEGA_TOOL_NAME: &str = "helios";
+
+/// Schema for the mega-tool. Deliberately tiny — the per-action
+/// schemas live in `helios(action="list_actions")` so the tools/list
+/// payload stays under ~500 bytes regardless of how many sub-actions
+/// the plugin and engine expose.
+pub fn mega_tool_descriptor() -> JsonValue {
+    json!({
+        "name": MEGA_TOOL_NAME,
+        "description": "One-tool gateway to the heliosdb-codekb MCP. \
+            Call with {action: \"<name>\", args: {...}}. Available actions: \
+            repo_summary, outline_first, doc_drill, semantic_filter, git_summary, \
+            symbol_card (plugin wrappers); plus passthrough to any engine tool by \
+            short name (e.g. action=\"lsp_definition\", \"graphrag_search\", \
+            \"query\", \"ast_diff\"). Use action=\"list_actions\" to fetch the \
+            full per-action arg schema catalogue on demand.",
+        "inputSchema": {
+            "type": "object",
+            "required": ["action"],
+            "properties": {
+                "action": {
+                    "type": "string",
+                    "description": "Sub-action name. See list_actions for schemas."
+                },
+                "args": {
+                    "type": "object",
+                    "description": "Action arguments (action-specific)."
+                }
+            }
+        }
+    })
+}
+
+/// Translate a plugin wrapper or engine tool name into the
+/// equivalent `tools/call` it represents. Returns:
+///
+/// * Plugin wrapper: short name → its full plugin-tool name (the
+///   plugin handler is then invoked via `dispatch`).
+/// * Engine tool: short name → its full engine-tool name (`heliosdb_*`
+///   or `helios_*`). Caller routes to `handle_rpc_with_db`.
+///
+/// Short-name conventions:
+/// * Plugin wrappers drop the `helios_` prefix (`repo_summary`,
+///   `symbol_card`, …).
+/// * Engine tools also drop their prefix where unambiguous
+///   (`query` → `heliosdb_query`, `lsp_definition` →
+///   `helios_lsp_definition`, `graphrag_search` →
+///   `helios_graphrag_search`, `ast_diff` → `helios_ast_diff`, etc.).
+pub fn resolve_action_name(action: &str) -> Option<&'static str> {
+    match action {
+        // Plugin wrappers (drop the `helios_` prefix).
+        "repo_summary" => Some("helios_repo_summary"),
+        "outline_first" => Some("helios_outline_first"),
+        "doc_drill" => Some("helios_doc_drill"),
+        "semantic_filter" => Some("helios_semantic_filter"),
+        "git_summary" => Some("helios_git_summary"),
+        "symbol_card" => Some("helios_symbol_card"),
+        // Engine read-only tools we want exposed under the mega-tool.
+        "query" => Some("heliosdb_query"),
+        "hybrid_search" => Some("heliosdb_hybrid_search"),
+        "graphrag_search" => Some("helios_graphrag_search"),
+        "lsp_definition" => Some("helios_lsp_definition"),
+        "lsp_references" => Some("helios_lsp_references"),
+        "lsp_call_hierarchy" => Some("helios_lsp_call_hierarchy"),
+        "lsp_hover" => Some("helios_lsp_hover"),
+        "lsp_document_symbols" => Some("helios_lsp_document_symbols"),
+        "ast_diff" => Some("helios_ast_diff"),
+        "list_actions" => Some("__list_actions"),
+        _ => None,
+    }
+}
+
+/// Build the per-action schema catalogue returned by
+/// `helios(action="list_actions")`. One JSON object per action, with
+/// name + 1-line description + minimal input schema. Total payload
+/// ~3 KB — fetched once on demand, NOT re-cached every turn.
+pub fn list_actions_payload() -> JsonValue {
+    let mut entries = Vec::with_capacity(PLUGIN_TOOLS.len() + 9);
+    for tool in PLUGIN_TOOLS {
+        let short = tool.name.trim_start_matches("helios_");
+        entries.push(json!({
+            "action": short,
+            "description": tool.description,
+            "input_schema": (tool.input_schema)(),
+        }));
+    }
+    // Engine tools we route to. Schemas are intentionally NOT
+    // included here — the agent can call action="list_actions" once,
+    // then for any engine-action call, the engine will validate the
+    // args at dispatch time.
+    let engine_actions = &[
+        ("query", "Read-only SQL query against the embedded engine. args: {sql: string}"),
+        ("hybrid_search", "BM25 + HNSW fusion over a user table. args: {table, query, k?}"),
+        ("graphrag_search", "Seed-text BFS expand. args: {seed_text, hops?, limit?, seed_kinds?, edge_kinds?}"),
+        ("lsp_definition", "Symbol definition lookup. args: {name, hint_file?, hint_kind?}"),
+        ("lsp_references", "All references to a symbol. args: {symbol_id}"),
+        ("lsp_call_hierarchy", "Caller/callee traversal. args: {symbol_id, direction, depth}"),
+        ("lsp_hover", "Signature + docstring. args: {symbol_id}"),
+        ("lsp_document_symbols", "Symbols in one file. args: {path}"),
+        ("ast_diff", "AST-level diff between branches/commits. args: {file, at_a, at_b}"),
+    ];
+    for (a, d) in engine_actions {
+        entries.push(json!({"action": a, "description": d, "input_schema": "see engine tool"}));
+    }
+    json!({"actions": entries})
+}
+
+/// Dispatch a mega-tool call. Returns `Some(plugin_result)` when the
+/// action is handled in-plugin or `None` when the caller should route
+/// to the engine via `handle_rpc_with_db`. The caller is responsible
+/// for re-wrapping the engine call to use the resolved tool name (see
+/// `resolve_action_name`).
+pub fn dispatch_mega(
+    db: &EmbeddedDatabase,
+    action: &str,
+    args: &JsonValue,
+) -> Option<Result<JsonValue, String>> {
+    if action == "list_actions" {
+        return Some(Ok(list_actions_payload()));
+    }
+    let resolved = resolve_action_name(action)?;
+    // Plugin actions → dispatch in-process.
+    if resolved.starts_with("helios_") && is_plugin_tool(resolved) {
+        return dispatch(db, resolved, args);
+    }
+    // Engine action — caller routes via handle_rpc_with_db with the
+    // resolved name. Signal that by returning None here AFTER the
+    // caller has already short-circuited on `MEGA_TOOL_NAME`.
+    None
+}
+
 /// Wrap a plugin-handler value into the MCP `tools/call` result
 /// envelope shape: `{"content":[{"type":"text","text": "<json>"}],
 /// "isError": false}`. Used by both transports so the agent sees
@@ -135,51 +271,37 @@ pub fn wrap_call_error(message: impl Into<String>) -> JsonValue {
 pub const PLUGIN_TOOLS: &[ToolDesc] = &[
     ToolDesc {
         name: "helios_repo_summary",
-        description: "Pre-distilled repository overview backed by `_hdb_plugin_repomap_cards`. \
-            One call returns a PageRank-ranked file index with per-file signature stubs — \
-            no need for the agent to walk Read+Grep across the tree. \
-            `detail` ∈ {minimal,file_index,symbol_index} chooses card density.",
+        description: "PageRank-ranked file index w/ top symbols.",
         input_schema: repo_summary_schema,
         handler: repo_summary_handler,
     },
     ToolDesc {
         name: "helios_outline_first",
-        description: "Heading-only doc retrieval. Returns DocSection nodes (titles + first-line \
-            summaries) for the query, no DocChunk bodies. Drill into a section with \
-            `helios_doc_drill(section_id)` once the right heading is found.",
+        description: "Doc headings + 1-line summaries (no chunk bodies).",
         input_schema: outline_first_schema,
         handler: outline_first_handler,
     },
     ToolDesc {
         name: "helios_doc_drill",
-        description: "Expand a DocSection into its child DocChunks (one BFS hop along PART_OF \
-            edges). Pair with `helios_outline_first` for outline-first retrieval — the \
-            agent picks a section by title, then drills only that section instead of \
-            scanning the whole doc tree.",
+        description: "Expand one DocSection into its child chunks.",
         input_schema: doc_drill_schema,
         handler: doc_drill_handler,
     },
     ToolDesc {
         name: "helios_semantic_filter",
-        description: "Filtered KNN — semantic similarity + lang/kind/path predicates in one \
-            traversal. Eliminates the 'oversized subgraph' failure mode where post-filtering \
-            blows up token cost. Requires `vector-persist` Cargo feature.",
+        description: "Filtered KNN: semantic + lang/kind/path predicates.",
         input_schema: semantic_filter_schema,
         handler: semantic_filter_handler,
     },
     ToolDesc {
         name: "helios_git_summary",
-        description: "Structural diff between two commits — returns added/removed/moved/signature-\
-            changed symbols, NOT raw line diffs. ~10× smaller than `git diff` for typical \
-            refactor audits; backed by the engine's AST diff + body diff.",
+        description: "Structural diff (added/removed/moved/sig-changed) between two commits.",
         input_schema: git_summary_schema,
         handler: git_summary_handler,
     },
     ToolDesc {
         name: "helios_symbol_card",
-        description: "Single-call symbol card: signature, first-line docstring, ≤5 callers, \
-            ≤5 callees, file+line range. Replaces a Read+Grep loop for 'where is X defined / \
-            who calls it' questions.",
+        description: "Symbol card: sig + doc + ≤5 callers + ≤5 callees in one call.",
         input_schema: symbol_card_schema,
         handler: symbol_card_handler,
     },

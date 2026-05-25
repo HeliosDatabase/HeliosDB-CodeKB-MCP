@@ -33,9 +33,21 @@
 //! for a 1-sentence purpose summary; see plan docs.
 
 use std::collections::HashMap;
+use std::io::{BufRead, BufReader, BufWriter, Write};
 
 use anyhow::{Context, Result};
 use heliosdb_nano::{EmbeddedDatabase, Value};
+
+// Bulk-write tuning, mirroring `crate::linker`'s constants. Picked so
+// that a single statement fits in ~40 KB of SQL text (well under any
+// reasonable parser limit) and a single batch commits ~25 K rows
+// (fits in the engine's default WAL flush window without stalling).
+const ROWS_PER_INSERT_STMT: usize = 500;
+const STMTS_PER_BATCH: usize = 50;
+// Hard cap on per-row text fields. Distill cards are advisory; we'd
+// rather drop a few KB of a giant function signature than blow up
+// the SQL text size.
+const MAX_FIELD_BYTES: usize = 4096;
 
 #[derive(Debug, Default, Clone)]
 pub struct DistillStats {
@@ -97,7 +109,13 @@ pub fn build_symbol_cards(db: &EmbeddedDatabase) -> Result<DistillStats> {
     ensure_tables(db)?;
     let mut stats = DistillStats::default();
 
-    // Pull existing cards for idempotency comparison.
+    // Pull existing cards for idempotency comparison. NOTE: the
+    // engine's `query` path emits a parser warning + returns Err on
+    // tables created mid-session in some scenarios; we tolerate that
+    // and fall back to an empty map (a re-run then re-INSERTs every
+    // row, hitting the PK guard — which is then handled by always
+    // pairing the INSERTs with a DELETE-by-key in the bulk_upsert
+    // path below).
     let existing: HashMap<String, String> = match db.query(
         &format!("SELECT qualified, content_hash FROM {SYMBOL_CARDS_TABLE}"),
         &[],
@@ -114,8 +132,15 @@ pub fn build_symbol_cards(db: &EmbeddedDatabase) -> Result<DistillStats> {
                 }
             })
             .collect(),
-        Err(_) => HashMap::new(),
+        Err(e) => {
+            tracing::debug!("symbol_cards existing-load returned err (treating as empty): {e}");
+            HashMap::new()
+        }
     };
+    tracing::debug!(
+        "build_symbol_cards: existing.len()={}",
+        existing.len()
+    );
 
     // Load every src file's content once, build a per-file line index
     // keyed by path so the per-symbol comment lookup is O(1).
@@ -132,26 +157,63 @@ pub fn build_symbol_cards(db: &EmbeddedDatabase) -> Result<DistillStats> {
         }
     }
 
-    // Pull every symbol with its file path. NULL qualified ⇒ skip
-    // (no key to UPSERT against).
-    let sql = "SELECT s.qualified, s.signature, s.line_start, f.path \
-               FROM _hdb_code_symbols s \
-               JOIN _hdb_code_files f ON f.node_id = s.file_id \
-               WHERE s.qualified IS NOT NULL AND s.qualified <> ''";
-    let rows = db.query(sql, &[]).context("fetch code symbols")?;
-    stats.symbols_scanned = rows.len();
+    // Engine quirk: on the FIRST ingest pass, a SELECT with a JOIN
+    // against `_hdb_code_symbols` returns 0 rows (observed in
+    // bench/codekb-smoke runs; the same JOIN in build_repomap_cards
+    // works because it runs after this function). Pull the two
+    // tables separately and join in Rust — slower in theory but
+    // reliable and tolerable at the corpus scales we care about.
+    let sym_rows = db
+        .query(
+            "SELECT node_id, file_id, qualified, signature, line_start FROM _hdb_code_symbols",
+            &[],
+        )
+        .context("fetch _hdb_code_symbols")?;
+    let file_rows = db
+        .query("SELECT node_id, path FROM _hdb_code_files", &[])
+        .context("fetch _hdb_code_files")?;
+    let file_path: HashMap<i64, String> = file_rows
+        .iter()
+        .filter_map(|r| {
+            let id = tuple_int(r, 0)?;
+            let p = tuple_str(r, 1);
+            if p.is_empty() { None } else { Some((id, p)) }
+        })
+        .collect();
+    stats.symbols_scanned = sym_rows.len();
 
-    // Build UPSERT batches: one DELETE-then-INSERT per row keeps the
-    // logic simple. Volumes are bounded (~100k symbols) so we don't
-    // need the linker's tempfile-backed bulk path.
-    for row in &rows {
-        let qualified = tuple_str(row, 0);
-        let signature = tuple_str(row, 1);
-        let line_start = tuple_int(row, 2).unwrap_or(0) as usize;
-        let path = tuple_str(row, 3);
+    // Single-pass bulk write. Hash-gate filters unchanged symbols
+    // before we ever touch the disk; the surviving (new + changed)
+    // rows are streamed to a tempfile as one-INSERT-per-row batches
+    // applied via `execute_batch` under `SET bulk_load_mode = true` —
+    // same pattern as `crate::linker::link_mentions_bulk` (the engine
+    // supports multi-row VALUES only for engine-managed tables like
+    // `_hdb_graph_edges`). For changed rows we DELETE first since
+    // `INSERT … ON CONFLICT` isn't on the engine's `execute_batch`
+    // path (only `execute_params` supports it).
+    //
+    // `_hdb_code_symbols.qualified` is NOT unique (a struct + an impl
+    // method can share a qualified prefix in some grammars; impls with
+    // the same name appear once per inherent block). Dedup last-wins
+    // via a HashMap before emitting INSERTs so the PK constraint on
+    // `_hdb_plugin_symbol_cards.qualified` doesn't fire.
+    let mut staged: HashMap<String, (String, String, String)> = HashMap::new();
+    for row in &sym_rows {
+        let _node_id = tuple_int(row, 0);
+        let file_id = match tuple_int(row, 1) {
+            Some(id) => id,
+            None => continue,
+        };
+        let qualified = tuple_str(row, 2);
+        let signature = tuple_str(row, 3);
+        let line_start = tuple_int(row, 4).unwrap_or(0) as usize;
         if qualified.is_empty() {
             continue;
         }
+        let path = match file_path.get(&file_id) {
+            Some(p) => p.clone(),
+            None => continue,
+        };
         let doc1l = file_lines
             .get(&path)
             .map(|lines| extract_doc1l(lines, line_start))
@@ -161,44 +223,200 @@ pub fn build_symbol_cards(db: &EmbeddedDatabase) -> Result<DistillStats> {
             stats.symbols_unchanged += 1;
             continue;
         }
-        upsert_symbol_card(db, &qualified, &signature, &doc1l, &hash)?;
-        stats.symbols_written += 1;
+        staged.insert(qualified, (cap(signature), cap(doc1l), hash));
     }
 
+    if staged.is_empty() {
+        return Ok(stats);
+    }
+
+    // Always DELETE the keys we're about to INSERT — covers the case
+    // where `existing` was loaded as empty (engine query glitch on a
+    // mid-session created table) while the table is in fact populated.
+    // Cheaper than the PK conflict that would otherwise abort the batch.
+    let to_delete: Vec<String> = staged.keys().cloned().collect();
+    let to_write: Vec<(String, String, String, String)> = staged
+        .into_iter()
+        .map(|(q, (s, d, h))| (q, s, d, h))
+        .collect();
+    bulk_upsert(
+        db,
+        SYMBOL_CARDS_TABLE,
+        "qualified",
+        &["qualified", "signature", "doc1l", "content_hash"],
+        &to_delete,
+        to_write
+            .iter()
+            .map(|(q, s, d, h)| {
+                vec![
+                    (q.as_str(), false),
+                    (s.as_str(), false),
+                    (d.as_str(), false),
+                    (h.as_str(), false),
+                ]
+            })
+            .collect::<Vec<_>>()
+            .as_slice(),
+    )?;
+    stats.symbols_written = to_write.len();
     Ok(stats)
 }
 
-fn upsert_symbol_card(
+/// Bulk DELETE (by key column) + INSERT (one row per statement) via
+/// `execute_batch` under `SET bulk_load_mode = true`. Same pattern as
+/// `crate::linker::link_mentions_bulk`. `key_col` is the PK column we
+/// DELETE on for changed rows; `cols` is the column list for the
+/// INSERT (`key_col` must be the first entry). Each entry in `rows`
+/// is a slice of (value, is_numeric) — when `is_numeric` we emit the
+/// value unquoted, otherwise `sql_lit`-escaped.
+fn bulk_upsert(
     db: &EmbeddedDatabase,
-    qualified: &str,
-    signature: &str,
-    doc1l: &str,
-    hash: &str,
+    table: &str,
+    key_col: &str,
+    cols: &[&str],
+    delete_keys: &[String],
+    rows: &[Vec<(&str, bool)>],
 ) -> Result<()> {
-    // Parameterized path — the engine implements ON CONFLICT under
-    // `execute_params` but NOT under plain `execute` (the engine's
-    // SQL-string path emits "Operator not yet implemented: Insert
-    // with on_conflict"). Same pattern as `upsert_src` in
-    // `src/ingest.rs`.
-    let sql = format!(
-        "INSERT INTO {SYMBOL_CARDS_TABLE} (qualified, signature, doc1l, content_hash) \
-         VALUES ($1, $2, $3, $4) \
-         ON CONFLICT(qualified) DO UPDATE SET \
-            signature = excluded.signature, \
-            doc1l = excluded.doc1l, \
-            content_hash = excluded.content_hash"
-    );
-    db.execute_params(
-        &sql,
-        &[
-            Value::String(qualified.to_string()),
-            Value::String(signature.to_string()),
-            Value::String(doc1l.to_string()),
-            Value::String(hash.to_string()),
-        ],
-    )
-    .with_context(|| format!("upsert symbol_card {qualified}"))?;
+    if rows.is_empty() && delete_keys.is_empty() {
+        return Ok(());
+    }
+    let tmp = tempfile::NamedTempFile::new().context("create distill tempfile")?;
+    let mut writer = BufWriter::new(tmp.reopen().context("reopen distill tempfile")?);
+
+    // Phase A: DELETEs in chunks of ROWS_PER_INSERT_STMT keys.
+    for chunk in delete_keys.chunks(ROWS_PER_INSERT_STMT) {
+        let mut stmt = format!("DELETE FROM {table} WHERE {key_col} IN (");
+        for (i, k) in chunk.iter().enumerate() {
+            if i > 0 {
+                stmt.push(',');
+            }
+            stmt.push_str(&sql_lit(k));
+        }
+        stmt.push(')');
+        writeln!(writer, "{stmt}").context("write delete stmt")?;
+    }
+
+    // Phase B: one INSERT statement per row. The engine's `execute`
+    // / `execute_batch` paths return "Operator not yet implemented:
+    // Insert with values: [[…], […]]" when more than one VALUES
+    // tuple is supplied for a user-defined table — the linker only
+    // gets away with multi-row INSERTs into `_hdb_graph_edges` (an
+    // engine-managed table). Single-row INSERTs are fine. Batching
+    // 50 statements per execute_batch still amortises ~all of the
+    // per-call cost.
+    let cols_csv = cols.join(", ");
+    for row in rows {
+        let mut stmt = format!("INSERT INTO {table} ({cols_csv}) VALUES (");
+        for (j, (v, is_numeric)) in row.iter().enumerate() {
+            if j > 0 {
+                stmt.push(',');
+            }
+            if *is_numeric {
+                stmt.push_str(v);
+            } else {
+                stmt.push_str(&sql_lit(v));
+            }
+        }
+        stmt.push(')');
+        writeln!(writer, "{stmt}").context("write insert stmt")?;
+    }
+    writer.flush().context("flush distill tempfile")?;
+    drop(writer);
+
+    // Apply pass — best-effort SET bulk_load_mode, then batched
+    // execute_batch. Older engine versions don't recognise the
+    // setting; we still proceed in either case.
+    let bulk_enabled = db.execute("SET bulk_load_mode = true").is_ok();
+    let result = apply_from_tempfile(db, tmp.path());
+    if bulk_enabled {
+        let _ = db.execute("SET bulk_load_mode = false");
+    }
+    result
+}
+
+fn apply_from_tempfile(db: &EmbeddedDatabase, path: &std::path::Path) -> Result<()> {
+    let file = std::fs::File::open(path)
+        .with_context(|| format!("re-open distill tempfile {}", path.display()))?;
+    let reader = BufReader::new(file);
+    let mut batch: Vec<String> = Vec::with_capacity(STMTS_PER_BATCH);
+    for line in reader.lines() {
+        let stmt = line.context("read distill tempfile line")?;
+        if stmt.is_empty() {
+            continue;
+        }
+        batch.push(stmt);
+        if batch.len() >= STMTS_PER_BATCH {
+            flush_batch(db, &batch)?;
+            batch.clear();
+        }
+    }
+    flush_batch(db, &batch)?;
     Ok(())
+}
+
+fn flush_batch(db: &EmbeddedDatabase, batch: &[String]) -> Result<()> {
+    if batch.is_empty() {
+        return Ok(());
+    }
+    let refs: Vec<&str> = batch.iter().map(String::as_str).collect();
+    if let Err(e) = db.execute_batch(&refs) {
+        // Best-effort: dump the failing batch to /tmp so the error
+        // chain points at the exact statement. Helps debug parser
+        // errors on long string IN-lists / multibyte literals.
+        let dump = format!("/tmp/distill-failing-batch-{}.sql", std::process::id());
+        let _ = std::fs::write(&dump, batch.join("\n"));
+        anyhow::bail!(
+            "execute_batch({} stmts) for distill bulk load: {e:#} (failing batch dumped to {dump})",
+            refs.len()
+        );
+    }
+    Ok(())
+}
+
+/// ASCII-sanitize multibyte chars in a text field. The engine's SQL
+/// parser miscounts column positions on multibyte literals (em-dash
+/// triggers `Unterminated string literal` reports + a related
+/// `with_context.rs:125` byte-boundary panic on the parameterized
+/// path). Replacing `—` with `-` etc. costs us nothing semantically;
+/// the cards are advisory text.
+fn sanitize(s: String) -> String {
+    if s.is_ascii() {
+        return s;
+    }
+    s.chars()
+        .map(|c| if c.is_ascii() { c } else { ascii_fallback(c) })
+        .collect()
+}
+
+/// Cap a text field at MAX_FIELD_BYTES on a char boundary AND
+/// ASCII-sanitize. Used for fields whose worst-case size is
+/// unbounded (signatures, doc1ls). Sequencing matters: sanitize
+/// FIRST (replaces each multibyte char with 1 ASCII byte), THEN cap
+/// — otherwise capping a mid-emoji byte position panics.
+fn cap(s: String) -> String {
+    let sanitized = sanitize(s);
+    if sanitized.len() <= MAX_FIELD_BYTES {
+        return sanitized;
+    }
+    sanitized[..MAX_FIELD_BYTES].to_string()
+}
+
+/// Best-effort one-char substitutes for the multibyte chars most
+/// commonly seen in doc headings and code comments. Everything else
+/// collapses to `?` — the card just loses a glyph, the structure is
+/// preserved.
+fn ascii_fallback(c: char) -> char {
+    match c {
+        '\u{2013}' | '\u{2014}' => '-',                 // en-dash, em-dash
+        '\u{2018}' | '\u{2019}' => '\'',                // smart single quotes
+        '\u{201C}' | '\u{201D}' => '"',                 // smart double quotes
+        '\u{2026}' => '.',                              // ellipsis
+        '\u{00A0}' => ' ',                              // nbsp
+        '\u{2192}' | '\u{2190}' => '-',                 // arrows
+        '\u{2713}' | '\u{2705}' => '+',                 // checkmark
+        '\u{2717}' | '\u{274C}' => 'x',                 // x-mark
+        _ => '?',
+    }
 }
 
 /// Pull up to 120 chars of the leading comment line(s) directly above
@@ -345,9 +563,10 @@ pub fn build_repomap_cards(db: &EmbeddedDatabase) -> Result<DistillStats> {
         }
     }
 
+    // Build owned row strings so bulk_upsert's &str slice can borrow.
+    let mut rendered: Vec<(String, String, String)> = Vec::with_capacity(file_score.len());
     for (path, score) in &file_score {
         let mut syms = file_syms.remove(path).unwrap_or_default();
-        // Rank in-file by individual symbol PageRank for clarity.
         syms.sort_by(|a, b| {
             ranks
                 .get(b)
@@ -374,36 +593,37 @@ pub fn build_repomap_cards(db: &EmbeddedDatabase) -> Result<DistillStats> {
                 })
                 .collect(),
         );
-        upsert_repomap_card(db, path, *score, &top_json.to_string())?;
-        stats.files_written += 1;
+        // Top-symbols JSON is bounded (top-10 × ~500 B) so we sanitize
+        // without capping — capping would shred the JSON structure.
+        rendered.push((sanitize(path.clone()), format!("{score}"), sanitize(top_json.to_string())));
+    }
+
+    if !rendered.is_empty() {
+        // For files we always replace — they're cheap and PageRank
+        // shifts every ingest. Mass-DELETE the whole set then INSERT.
+        let delete_keys: Vec<String> = rendered.iter().map(|(p, _, _)| p.clone()).collect();
+        let rows: Vec<Vec<(&str, bool)>> = rendered
+            .iter()
+            .map(|(p, s, j)| {
+                vec![
+                    (p.as_str(), false),
+                    (s.as_str(), true), // pagerank — emit unquoted (DOUBLE PRECISION column)
+                    (j.as_str(), false),
+                ]
+            })
+            .collect();
+        bulk_upsert(
+            db,
+            REPOMAP_CARDS_TABLE,
+            "path",
+            &["path", "pagerank", "top_symbols"],
+            &delete_keys,
+            &rows,
+        )?;
+        stats.files_written = rendered.len();
     }
 
     Ok(stats)
-}
-
-fn upsert_repomap_card(
-    db: &EmbeddedDatabase,
-    path: &str,
-    pagerank: f64,
-    top_symbols_json: &str,
-) -> Result<()> {
-    let sql = format!(
-        "INSERT INTO {REPOMAP_CARDS_TABLE} (path, pagerank, top_symbols) \
-         VALUES ($1, $2, $3) \
-         ON CONFLICT(path) DO UPDATE SET \
-            pagerank = excluded.pagerank, \
-            top_symbols = excluded.top_symbols"
-    );
-    db.execute_params(
-        &sql,
-        &[
-            Value::String(path.to_string()),
-            Value::Float8(pagerank),
-            Value::String(top_symbols_json.to_string()),
-        ],
-    )
-    .with_context(|| format!("upsert repomap_card {path}"))?;
-    Ok(())
 }
 
 // ---------------------------------------------------------------------------
@@ -578,15 +798,125 @@ pub fn build_llm_summaries(
 
     let mut stats = LlmDistillStats::default();
 
-    // Snapshot every symbol card with its supporting signature + path
-    // + body excerpt. Joining once up-front beats one-per-symbol
-    // queries from the worker threads.
-    let sql = "SELECT c.qualified, c.signature, c.doc1l, c.content_hash, c.llm_summary, c.llm_model, \
-                      f.path, s.line_start, s.line_end \
-               FROM _hdb_plugin_symbol_cards c \
-               JOIN _hdb_code_symbols s ON s.qualified = c.qualified \
-               JOIN _hdb_code_files f ON f.node_id = s.file_id";
-    let rows = db.query(sql, &[]).context("snapshot symbol cards")?;
+    // Snapshot every symbol card. We pull from THREE tables
+    // separately and join in Rust — the engine's planner intermittently
+    // returns 0 rows on multi-way JOINs against fresh-txn snapshots
+    // (see the note in build_symbol_cards), and ordering by a JOIN
+    // column makes the issue worse.
+    //
+    // Symbols are sorted by their containing file's PageRank
+    // (descending) so `--llm-distill-max-symbols N` covers the most
+    // important code first — a 2k-cap on a 178k-symbol corpus then
+    // distills the API surface, not random utility functions.
+    let card_rows = db
+        .query(
+            "SELECT qualified, signature, doc1l, content_hash, llm_summary, llm_model \
+             FROM _hdb_plugin_symbol_cards",
+            &[],
+        )
+        .context("fetch _hdb_plugin_symbol_cards")?;
+    let sym_rows = db
+        .query(
+            "SELECT qualified, file_id, line_start, line_end FROM _hdb_code_symbols",
+            &[],
+        )
+        .context("fetch _hdb_code_symbols")?;
+    let file_rows = db
+        .query("SELECT node_id, path FROM _hdb_code_files", &[])
+        .context("fetch _hdb_code_files")?;
+    let repomap_rows = db
+        .query(
+            "SELECT path, pagerank FROM _hdb_plugin_repomap_cards",
+            &[],
+        )
+        .unwrap_or_default();
+
+    // qualified → (file_id, line_start, line_end). Last-wins on
+    // duplicate qualifieds (matches build_symbol_cards's HashMap
+    // dedup behaviour).
+    let mut sym_meta: HashMap<String, (i64, i64, i64)> = HashMap::with_capacity(sym_rows.len());
+    for r in &sym_rows {
+        let q = tuple_str(r, 0);
+        if q.is_empty() { continue; }
+        let fid = tuple_int(r, 1).unwrap_or(0);
+        let ls = tuple_int(r, 2).unwrap_or(0);
+        let le = tuple_int(r, 3).unwrap_or(0);
+        sym_meta.insert(q, (fid, ls, le));
+    }
+    let file_path: HashMap<i64, String> = file_rows
+        .iter()
+        .filter_map(|r| {
+            let id = tuple_int(r, 0)?;
+            let p = tuple_str(r, 1);
+            if p.is_empty() { None } else { Some((id, p)) }
+        })
+        .collect();
+    let file_pr: HashMap<String, f64> = repomap_rows
+        .iter()
+        .filter_map(|r| {
+            let p = tuple_str(r, 0);
+            if p.is_empty() {
+                return None;
+            }
+            let pr = match r.get(1) {
+                Some(heliosdb_nano::Value::Float8(f)) => *f,
+                Some(heliosdb_nano::Value::Float4(f)) => *f as f64,
+                _ => 0.0,
+            };
+            Some((p, pr))
+        })
+        .collect();
+
+    // Build the snapshot list, attaching path + pagerank so we can
+    // sort by it. Returned as Tuple-shape items so the rest of the
+    // function flows like the old SELECT JOIN result.
+    #[derive(Clone)]
+    struct CardSnap {
+        qualified: String,
+        signature: String,
+        doc1l: String,
+        content_hash: String,
+        llm_summary: String,
+        llm_model: String,
+        path: String,
+        line_start: i64,
+        line_end: i64,
+        pagerank: f64,
+    }
+    let mut rows: Vec<CardSnap> = Vec::with_capacity(card_rows.len());
+    for r in &card_rows {
+        let qualified = tuple_str(r, 0);
+        if qualified.is_empty() { continue; }
+        let (file_id, line_start, line_end) = match sym_meta.get(&qualified) {
+            Some(m) => *m,
+            None => continue,
+        };
+        let path = match file_path.get(&file_id) {
+            Some(p) => p.clone(),
+            None => continue,
+        };
+        let pagerank = file_pr.get(&path).copied().unwrap_or(0.0);
+        rows.push(CardSnap {
+            qualified,
+            signature: tuple_str(r, 1),
+            doc1l: tuple_str(r, 2),
+            content_hash: tuple_str(r, 3),
+            llm_summary: tuple_str(r, 4),
+            llm_model: tuple_str(r, 5),
+            path,
+            line_start,
+            line_end,
+            pagerank,
+        });
+    }
+    // PageRank-descending. Stable sort on `qualified` as tiebreaker
+    // for deterministic --max-symbols caps across runs.
+    rows.sort_by(|a, b| {
+        b.pagerank
+            .partial_cmp(&a.pagerank)
+            .unwrap_or(std::cmp::Ordering::Equal)
+            .then_with(|| a.qualified.cmp(&b.qualified))
+    });
     stats.candidates = rows.len();
 
     // Pre-load src.content so workers don't all hit the DB
@@ -616,43 +946,24 @@ pub fn build_llm_summaries(
     }
 
     let mut jobs: Vec<Job> = Vec::with_capacity(rows.len());
-    for row in &rows {
-        let qualified = tuple_str(row, 0);
-        if qualified.is_empty() {
-            continue;
-        }
-        let signature = tuple_str(row, 1);
-        let doc1l = tuple_str(row, 2);
-        let content_hash = tuple_str(row, 3);
-        let existing_summary = tuple_str(row, 4);
-        let existing_model = tuple_str(row, 5);
-        let path = tuple_str(row, 6);
-        let line_start = match row.get(7) {
-            Some(heliosdb_nano::Value::Int8(i)) => *i as usize,
-            Some(heliosdb_nano::Value::Int4(i)) => *i as usize,
-            _ => 0,
-        };
-        let line_end = match row.get(8) {
-            Some(heliosdb_nano::Value::Int8(i)) => *i as usize,
-            Some(heliosdb_nano::Value::Int4(i)) => *i as usize,
-            _ => 0,
-        };
-
+    for snap in &rows {
         // Idempotency: skip when the existing summary was generated
         // by THIS model from THIS content_hash (encoded into the
         // model-tagged hash we store).
-        let model_hash = format!("{}|{}", opts.model, content_hash);
-        if !existing_summary.is_empty() && existing_model == model_hash {
+        let model_hash = format!("{}|{}", opts.model, snap.content_hash);
+        if !snap.llm_summary.is_empty() && snap.llm_model == model_hash {
             stats.unchanged += 1;
             continue;
         }
 
+        let line_start = snap.line_start as usize;
+        let line_end = snap.line_end as usize;
         // Body excerpt: up to 60 lines from the symbol's source range.
         // Keeps Ollama prompt small; Qwen3-coder 30B is fast on short
         // contexts but slows linearly past ~2k tokens.
         let body_excerpt = if line_start > 0 && line_end >= line_start {
             file_lines
-                .get(&path)
+                .get(&snap.path)
                 .map(|lines| {
                     let from = line_start.saturating_sub(1);
                     let to = (line_end).min(lines.len()).min(from + 60);
@@ -664,10 +975,10 @@ pub fn build_llm_summaries(
         };
 
         jobs.push(Job {
-            qualified,
-            signature,
-            doc1l,
-            content_hash,
+            qualified: snap.qualified.clone(),
+            signature: snap.signature.clone(),
+            doc1l: snap.doc1l.clone(),
+            content_hash: snap.content_hash.clone(),
             body_excerpt,
         });
         if opts.max_symbols > 0 && jobs.len() >= opts.max_symbols {

@@ -110,6 +110,18 @@ enum Commands {
         /// config TOML if not passed, then to `200`.
         #[arg(long, value_name = "MODE")]
         strip_tool_descriptions: Option<String>,
+
+        /// Collapse every tool — plugin wrappers AND engine read-only
+        /// tools — behind one `helios(action, args)` dispatcher.
+        /// `tools/list` returns only the mega-tool entry (~500 bytes
+        /// vs ~16 KB), eliminating the per-turn cache-read overhead
+        /// that dominates MCP cost on small models. The agent calls
+        /// `helios(action="list_actions")` once on demand to fetch
+        /// the per-action schema catalogue. Implies that callers
+        /// dispatch all reads through one tool name — measure both
+        /// modes and pick per project.
+        #[arg(long, default_value_t = false)]
+        mega_tool: bool,
     },
 
     /// Create / configure a KB for a source path. Persists the choice
@@ -300,6 +312,7 @@ async fn main() -> Result<()> {
             max_tool_result_bytes,
             profile,
             strip_tool_descriptions,
+            mega_tool,
         } => {
             serve(
                 &source,
@@ -307,6 +320,7 @@ async fn main() -> Result<()> {
                 max_tool_result_bytes,
                 profile.as_deref(),
                 strip_tool_descriptions.as_deref(),
+                mega_tool,
             )
             .await
         }
@@ -435,6 +449,7 @@ async fn serve(
     max_tool_result_bytes: usize,
     cli_profile: Option<&str>,
     cli_strip: Option<&str>,
+    mega_tool: bool,
 ) -> Result<()> {
     let cfg = Config::load_or_default()?;
     let spec = cfg
@@ -469,6 +484,7 @@ async fn serve(
         profile,
         strip_desc,
         max_tool_result_bytes,
+        mega_tool,
     };
 
     match http {
@@ -529,23 +545,18 @@ struct GatewayCfg {
     profile: mcp_trim::Profile,
     strip_desc: mcp_trim::StripDescMode,
     max_tool_result_bytes: usize,
+    mega_tool: bool,
 }
 
 impl GatewayCfg {
     /// `true` when no rewrites are needed AND the plugin has no
     /// wrappers to inject — the engine's loop / router can serve
-    /// directly. Layer 2 added the plugin-wrapper tools, so the
-    /// passthrough path is now narrower: only `Profile::Full` with no
-    /// stripping AND no body cap qualifies, AND we never expose
-    /// wrappers under Full (Full means "engine surface as-is"). Since
-    /// `Profile::Full` returns `true` for *every* tool name, the
-    /// wrapper tools ARE allowed under it — but we still don't inject
-    /// them in the passthrough branch because the engine doesn't
-    /// implement their dispatch. So this check stays exactly the same;
-    /// the passthrough path runs only when the user opted into
-    /// engine-native behaviour.
+    /// directly. Mega-tool mode is never a passthrough — the
+    /// gateway has to replace `tools/list` and route every
+    /// `helios(action, args)` call.
     fn is_passthrough(&self) -> bool {
-        self.profile == mcp_trim::Profile::Full
+        !self.mega_tool
+            && self.profile == mcp_trim::Profile::Full
             && matches!(self.strip_desc, mcp_trim::StripDescMode::None)
             && self.max_tool_result_bytes == 0
     }
@@ -555,12 +566,29 @@ impl GatewayCfg {
 /// response based on the original request method. Used by both
 /// transports so they stay in lockstep.
 ///
-/// Order for `tools/list`: engine → inject plugin wrappers → profile
-/// filter + description strip. Injection comes BEFORE filtering so
-/// the profile's allow list applies symmetrically to plugin and
-/// engine tools.
+/// Order for `tools/list`:
+/// * mega-tool mode: replace the entire result.tools array with the
+///   single `helios` descriptor — bypasses the engine catalogue
+///   entirely (smallest payload).
+/// * normal mode: engine → inject plugin wrappers → profile filter +
+///   description strip. Injection comes BEFORE filtering so the
+///   profile's allow list applies symmetrically to plugin and engine.
 fn apply_gateway_rewrite(json: &str, method: &str, cfg: &GatewayCfg) -> String {
     match method {
+        "tools/list" if cfg.mega_tool => {
+            // Replace the tools array with [mega_tool_descriptor].
+            let mut parsed: serde_json::Value = match serde_json::from_str(json) {
+                Ok(v) => v,
+                Err(_) => return json.to_string(),
+            };
+            if let Some(result) = parsed.get_mut("result").and_then(|r| r.as_object_mut()) {
+                result.insert(
+                    "tools".to_string(),
+                    serde_json::Value::Array(vec![wrappers::mega_tool_descriptor()]),
+                );
+            }
+            serde_json::to_string(&parsed).unwrap_or_else(|_| json.to_string())
+        }
         "tools/list" => {
             let with_wrappers = wrappers::inject_into_tools_list(json, cfg.profile);
             mcp_trim::trim_tools_list_wire(&with_wrappers, cfg.profile, cfg.strip_desc)
@@ -570,6 +598,62 @@ fn apply_gateway_rewrite(json: &str, method: &str, cfg: &GatewayCfg) -> String {
         }
         _ => json.to_string(),
     }
+}
+
+/// Mega-tool dispatch on the incoming RpcRequest. Returns
+/// `Some(wire_response_json)` when the request was a `tools/call
+/// helios(...)` and was handled (either by a plugin handler or by
+/// resolving + routing to the engine via `handle_rpc_with_db`).
+/// Returns `None` when the request isn't a mega-tool call.
+fn mega_tool_dispatch(
+    db: &heliosdb_nano::EmbeddedDatabase,
+    req: &heliosdb_nano::mcp::rpc::RpcRequest,
+    cfg: &GatewayCfg,
+) -> Option<String> {
+    if !cfg.mega_tool || req.method != "tools/call" {
+        return None;
+    }
+    let name = tools_call_name(&req.params)?;
+    if name != wrappers::MEGA_TOOL_NAME {
+        return None;
+    }
+    let args = req.params.get("arguments").cloned().unwrap_or(serde_json::Value::Null);
+    let id = req.id.clone().unwrap_or(serde_json::Value::Null);
+    let action = match args.get("action").and_then(|v| v.as_str()) {
+        Some(a) => a.to_string(),
+        None => {
+            return Some(plugin_handler_error_response(
+                id,
+                "helios mega-tool requires `action` string argument".to_string(),
+            ));
+        }
+    };
+    let sub_args = args.get("args").cloned().unwrap_or(serde_json::json!({}));
+    // 1. list_actions + plugin actions → dispatch_mega returns Some.
+    if let Some(result) = wrappers::dispatch_mega(db, &action, &sub_args) {
+        return Some(match result {
+            Ok(v) => plugin_success_response(id, v),
+            Err(msg) => plugin_handler_error_response(id, msg),
+        });
+    }
+    // 2. Engine action — resolve to its full tool name and route
+    //    through handle_rpc_with_db with a rewritten tools/call.
+    if let Some(engine_tool) = wrappers::resolve_action_name(&action) {
+        let inner_req = heliosdb_nano::mcp::rpc::RpcRequest {
+            jsonrpc: "2.0".to_string(),
+            id: req.id.clone(),
+            method: "tools/call".to_string(),
+            params: serde_json::json!({"name": engine_tool, "arguments": sub_args}),
+        };
+        let resp = heliosdb_nano::mcp::rpc::handle_rpc_with_db(db, inner_req);
+        return Some(serde_json::to_string(&resp).unwrap_or_default());
+    }
+    Some(plugin_handler_error_response(
+        id,
+        format!(
+            "unknown helios action `{action}` — call action=\"list_actions\" for the catalogue"
+        ),
+    ))
 }
 
 /// Extract `params.name` from a `tools/call` request so the dispatch
@@ -629,6 +713,16 @@ fn build_http_gateway_router(
     ) -> impl IntoResponse {
         let method = req.method.clone();
         let id = req.id.clone().unwrap_or(serde_json::Value::Null);
+
+        // Mega-tool short-circuit.
+        if let Some(mega_resp) = mega_tool_dispatch(state.db.as_ref(), &req, &cfg) {
+            return (
+                axum::http::StatusCode::OK,
+                [(axum::http::header::CONTENT_TYPE, "application/json")],
+                mega_resp,
+            )
+                .into_response();
+        }
 
         let out = if method == "tools/call" {
             if let Some(name) = tools_call_name(&req.params) {
@@ -741,8 +835,17 @@ async fn stdio_loop_with_gateway(
         let method = req.method.clone();
         let id = req.id.clone().unwrap_or(serde_json::Value::Null);
 
-        // Plugin-wrapper short-circuit: if this is a tools/call for a
-        // wrapper name, dispatch in-process and skip the engine.
+        // 1. Mega-tool short-circuit (--mega-tool only).
+        if let Some(mega_resp) = mega_tool_dispatch(db, &req, cfg) {
+            writeln!(stdout, "{mega_resp}")
+                .and_then(|()| stdout.flush())
+                .map_err(|e| anyhow::anyhow!("stdout write failed: {e}"))?;
+            continue;
+        }
+
+        // 2. Plugin-wrapper short-circuit: if this is a tools/call
+        //    for a wrapper name, dispatch in-process and skip the
+        //    engine. Otherwise fall through to the engine.
         let out_line = if method == "tools/call" {
             if let Some(name) = tools_call_name(&req.params) {
                 if let Some(result) = wrappers::dispatch(db, name, req.params.get("arguments").unwrap_or(&serde_json::Value::Null)) {
