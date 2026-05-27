@@ -21,6 +21,7 @@ with both Haiku 4.5 and Opus 4.7:
 | **Cross-modal queries** ("which doc section mentions the `FastEmbedder` symbol?") | `Read`+`Grep` literally can't answer in one shot. The plugin's text → code `MENTIONS` edges traverse both sides in one tool call. **Read+Grep has no equivalent.** |
 | **Time-travel, branch diff, AST diff** | `helios_ast_diff`, `heliosdb_branch_*`, `heliosdb_time_travel` answer "what did this symbol look like at commit X / on branch Y" with typed AST deltas. **Read+Grep cannot do this at all** — you'd need to checkout, build the index against the older state, and grep again. |
 | **Doc retrieval that returns one section, not the whole file** | When the `.md` ingest used `ChunkStrategy::Headings`, `helios_graphrag_search` returns the matching `DocSection` instead of the full file. Smaller chunks = direct token savings on doc-heavy workflows. |
+| **Compact one-tool mode** | Fresh installs default to `helios(action, args)`, a one-tool gateway that avoids re-advertising every engine schema on every turn. Use `action="ask"` for a server-routed answer card with compact evidence. |
 
 **What the plugin does NOT do well (yet):**
 
@@ -150,7 +151,10 @@ $BIN init \
   "mcpServers": {
     "helios": {
       "command": "/abs/path/to/heliosdb-codekb-mcp",
-      "args": ["serve", "--source", "/home/me/my-repo"]
+      "args": [
+        "serve", "--source", "/home/me/my-repo",
+        "--mega-tool", "--wrapper-cache-size", "128"
+      ]
     }
   }
 }

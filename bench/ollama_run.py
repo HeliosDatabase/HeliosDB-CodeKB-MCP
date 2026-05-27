@@ -79,7 +79,7 @@ WITHOUT_DIR = os.environ.get("WITHOUT_DIR")
 MCP_BIN = os.environ.get("MCP_BIN") or _find_mcp_binary()
 MCP_PROFILE = os.environ.get("MCP_PROFILE", "standard")
 MCP_STRIP = os.environ.get("MCP_STRIP", "200")
-MCP_MEGA = os.environ.get("MCP_MEGA", "0") == "1"
+MCP_MEGA = os.environ.get("MCP_MEGA", "1") == "1"
 STEER = os.environ.get("STEER", "0") == "1"
 STEER_PROMPT_PATH = Path(os.environ.get(
     "STEER_PROMPT",

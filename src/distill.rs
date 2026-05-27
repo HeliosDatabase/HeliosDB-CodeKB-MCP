@@ -532,16 +532,17 @@ pub fn build_repomap_cards(db: &EmbeddedDatabase) -> Result<DistillStats> {
 
     // Pull (name, signature) for every symbol once so we can build
     // per-file top-symbol arrays without N round-trips.
-    let mut sym_card: HashMap<i64, (String, String)> = HashMap::new();
+    let mut sym_card: HashMap<i64, (String, String, String)> = HashMap::new();
     if let Ok(rows) = db.query(
-        "SELECT node_id, name, signature FROM _hdb_code_symbols",
+        "SELECT node_id, name, qualified, signature FROM _hdb_code_symbols",
         &[],
     ) {
         for row in &rows {
             if let Some(sid) = tuple_int(row, 0) {
                 let name = tuple_str(row, 1);
-                let sig = tuple_str(row, 2);
-                sym_card.insert(sid, (name, sig));
+                let qualified = tuple_str(row, 2);
+                let sig = tuple_str(row, 3);
+                sym_card.insert(sid, (name, qualified, sig));
             }
         }
     }
@@ -580,13 +581,15 @@ pub fn build_repomap_cards(db: &EmbeddedDatabase) -> Result<DistillStats> {
             top_n
                 .iter()
                 .map(|sid| {
-                    let (name, signature) = sym_card
-                        .get(sid)
-                        .cloned()
-                        .unwrap_or((String::new(), String::new()));
-                    let doc1l = sym_doc.get(&name).cloned().unwrap_or_default();
+                    let (name, qualified, signature) = sym_card.get(sid).cloned().unwrap_or((
+                        String::new(),
+                        String::new(),
+                        String::new(),
+                    ));
+                    let doc1l = sym_doc.get(&qualified).cloned().unwrap_or_default();
                     serde_json::json!({
                         "name": name,
+                        "qualified": qualified,
                         "signature": signature,
                         "doc1l": doc1l,
                     })

@@ -252,7 +252,7 @@ python3 bench/ollama_compare.py $BENCH_DIR/results-phase2 > $BENCH_DIR/SUMMARY-p
 ### Agent loop details
 
 - `bench/ollama_run.py` issues a system prompt that asks the model to answer in 3-6 sentences, using the tools as needed.
-- WITH-MCP: launches `heliosdb-codekb-mcp serve --source $WITH_DIR --profile $MCP_PROFILE --strip-tool-descriptions $MCP_STRIP` as a subprocess and pipes JSON-RPC over its stdio. MCP `tools/list` is translated into OpenAI-format function definitions for Ollama's `/v1/chat/completions`.
+- WITH-MCP: launches `heliosdb-codekb-mcp serve --source $WITH_DIR --profile $MCP_PROFILE --strip-tool-descriptions $MCP_STRIP` as a subprocess and, by default, adds `--mega-tool` (`MCP_MEGA=0` disables). MCP `tools/list` is translated into OpenAI-format function definitions for Ollama's `/v1/chat/completions`.
 - WITHOUT-MCP: exposes 4 local tools — Read (64 KiB cap), Glob, Grep, Bash (60s + 8 KiB cap) — backed by the host filesystem under `$WITHOUT_DIR`.
 - Token counts come from Ollama's `usage.prompt_tokens` + `usage.completion_tokens` (no cache mechanic; no `cache_read_input_tokens` slot). Comparison is therefore on raw model tokens, not on cache-read tokens like the Claude bench.
 - Qwen3-coder occasionally emits inline `<function=…>` tool calls instead of the OpenAI JSON shape; the harness parses both formats so the agent loop doesn't dead-end.

@@ -174,31 +174,45 @@ fn all_plugin_wrappers_appear_in_tools_list() {
         .iter()
         .map(|t| t["name"].as_str().expect("name"))
         .collect();
-    for w in [
+    let expected = vec![
+        "helios_ask",
         "helios_repo_summary",
         "helios_outline_first",
         "helios_doc_drill",
-        "helios_semantic_filter",
         "helios_git_summary",
         "helios_symbol_card",
-    ] {
+    ];
+    #[cfg(feature = "wrappers-semantic")]
+    let expected = {
+        let mut expected = expected;
+        expected.push("helios_semantic_filter");
+        expected
+    };
+    for w in expected {
         assert!(
             names.contains(&w),
             "plugin wrapper {w} missing from tools/list under --profile standard; got {names:?}"
         );
     }
+    #[cfg(not(feature = "wrappers-semantic"))]
+    assert!(
+        !names.contains(&"helios_semantic_filter"),
+        "semantic_filter should not be advertised unless wrappers-semantic is enabled; got {names:?}"
+    );
 }
 
 #[test]
 fn helios_repo_summary_returns_envelope() {
     let f = Fixture::spawn();
-    let resp = f.call("helios_repo_summary", serde_json::json!({"detail": "minimal"}));
+    let resp = f.call(
+        "helios_repo_summary",
+        serde_json::json!({"detail": "minimal"}),
+    );
     // MCP `tools/call` envelope: {"result": {"content":[{"type":"text","text":"<json>"}], "isError": …}}
     let content_text = resp["result"]["content"][0]["text"]
         .as_str()
         .expect("text content");
-    let inner: serde_json::Value =
-        serde_json::from_str(content_text).expect("inner JSON parses");
+    let inner: serde_json::Value = serde_json::from_str(content_text).expect("inner JSON parses");
     // Either real card data, or the cards_not_built sentinel.
     assert!(
         inner.get("files").is_some() || inner["status"] == "cards_not_built",
@@ -216,8 +230,7 @@ fn helios_symbol_card_handles_missing_symbol_gracefully() {
     let content_text = resp["result"]["content"][0]["text"]
         .as_str()
         .expect("text content");
-    let inner: serde_json::Value =
-        serde_json::from_str(content_text).expect("inner JSON parses");
+    let inner: serde_json::Value = serde_json::from_str(content_text).expect("inner JSON parses");
     // Missing symbol → not_found, never a panic / JSON-RPC -32xxx.
     assert_eq!(
         inner["status"], "not_found",
@@ -232,14 +245,37 @@ fn helios_symbol_card_handles_missing_symbol_gracefully() {
 #[test]
 fn helios_outline_first_returns_sections_array() {
     let f = Fixture::spawn();
-    let resp = f.call("helios_outline_first", serde_json::json!({"query": "Sample"}));
+    let resp = f.call(
+        "helios_outline_first",
+        serde_json::json!({"query": "Sample"}),
+    );
     let content_text = resp["result"]["content"][0]["text"]
         .as_str()
         .expect("text content");
-    let inner: serde_json::Value =
-        serde_json::from_str(content_text).expect("inner JSON parses");
+    let inner: serde_json::Value = serde_json::from_str(content_text).expect("inner JSON parses");
     let sections = inner["sections"].as_array().expect("sections array");
     // Empty allowed (depends on whether graph_rag projected the README
     // section); shape must be valid.
     let _ = sections.len();
+    assert_eq!(inner["schema"], "helios.answer_card.v1");
+    assert!(inner["answer_card"].is_object());
+}
+
+#[test]
+fn helios_ask_returns_answer_card_envelope() {
+    let f = Fixture::spawn();
+    let resp = f.call(
+        "helios_ask",
+        serde_json::json!({"question": "Where is `add` defined?", "budget_tokens": 800}),
+    );
+    let content_text = resp["result"]["content"][0]["text"]
+        .as_str()
+        .expect("text content");
+    let inner: serde_json::Value = serde_json::from_str(content_text).expect("inner JSON parses");
+    assert_eq!(inner["schema"], "helios.answer_card.v1");
+    assert_eq!(inner["answer_card"]["kind"], "ask");
+    assert!(
+        inner["route"] == "symbol_card" || inner["route"] == "outline_first",
+        "ask should route through a compact wrapper; got {inner}"
+    );
 }

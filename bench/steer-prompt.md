@@ -1,12 +1,12 @@
-This project ships with a HeliosDB-Nano-backed code+docs knowledge base mounted as the `helios` MCP server. The plugin exposes **six wrapper tools** plus a curated subset of the engine's primitives. For code or documentation questions about this repository, prefer the wrappers — they replace 3+ round-trips through Read/Grep with one distilled call:
+This project ships with a HeliosDB-Nano-backed code+docs knowledge base mounted as the `helios` MCP server. In compact mode, call `helios(action="ask", args={"question":"..."})` first for broad repository questions. The plugin also exposes compact wrapper actions that replace 3+ round-trips through Read/Grep with one distilled answer card:
 
 **Wrapper-tool ranking (try in this order):**
 
-1. **`helios_repo_summary(detail="file_index")`** — when the question is "what's the architecture / where does this codebase live / what modules exist". Returns a PageRank-ranked file index with per-file top symbols, pre-computed at ingest.
-2. **`helios_outline_first(query="X")`** — when the question is documentation-shaped ("how does X work according to the docs"). Returns DocSection headings + 1-line summaries, NOT chunk bodies. Drill with `helios_doc_drill(section_id)` only if a heading looks relevant.
-3. **`helios_symbol_card(qualified_name="X")`** — when the question is "where is X defined / who calls it / what does X do". Returns signature + first-line docstring + ≤5 callers + ≤5 callees in one call. Skips the `Read` step entirely.
-4. **`helios_semantic_filter(query="X", where_lang=…, where_path_glob=…)`** — when the question is paraphrase-style ("find anything related to caching"). Filters on language/kind/path BEFORE the vector traversal, so the result doesn't blow up.
-5. **`helios_git_summary(commit_a, commit_b)`** — when the question is "what changed between A and B". Returns structured added/removed/moved/signature-changed rows, NOT raw `git diff` text.
+1. **`helios(action="ask", args={"question":"X", "budget_tokens":1500})`** — default first call. Routes to the smallest applicable wrapper and returns an answer-card with evidence.
+2. **`helios(action="repo_summary", args={"detail":"file_index"})`** — when the question is "what's the architecture / where does this codebase live / what modules exist".
+3. **`helios(action="outline_first", args={"query":"X"})`** — documentation-shaped questions. Returns DocSection headings + 1-line summaries, NOT chunk bodies. Drill with `doc_drill` only if a heading looks relevant.
+4. **`helios(action="symbol_card", args={"qualified_name":"X"})`** — when the question is "where is X defined / who calls it / what does X do". Returns signature + summary + callers/callees in one call.
+5. **`helios(action="git_summary", args={...})`** — when the question is "what changed between A and B". Returns structured added/removed/moved rows, NOT raw `git diff` text.
 
 **Fall back to the engine primitives** (`helios_graphrag_search`, `helios_lsp_definition`, `helios_lsp_references`, `helios_ast_diff`, `heliosdb_query`) only when:
 - A wrapper returned `{"status": "not_found"}` or `{"status": "cards_not_built"}`.

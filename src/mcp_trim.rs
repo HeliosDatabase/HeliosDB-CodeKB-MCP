@@ -84,9 +84,11 @@ impl Profile {
 /// names without pulling in `wrappers` at module-init time.
 #[allow(dead_code)]
 const WRAPPER_TOOLS: &[&str] = &[
+    "helios_ask",
     "helios_repo_summary",
     "helios_outline_first",
     "helios_doc_drill",
+    #[cfg(feature = "wrappers-semantic")]
     "helios_semantic_filter",
     "helios_git_summary",
     "helios_symbol_card",
@@ -95,9 +97,11 @@ const WRAPPER_TOOLS: &[&str] = &[
 /// Minimal profile: wrappers + `heliosdb_query` (escape hatch for
 /// custom SQL the wrappers don't cover).
 const MINIMAL_ALLOW: &[&str] = &[
+    "helios_ask",
     "helios_repo_summary",
     "helios_outline_first",
     "helios_doc_drill",
+    #[cfg(feature = "wrappers-semantic")]
     "helios_semantic_filter",
     "helios_symbol_card",
     "heliosdb_query",
@@ -109,9 +113,11 @@ const MINIMAL_ALLOW: &[&str] = &[
 /// `helios_lsp_rename_*` writers — agents don't write to the KB.
 const STANDARD_ALLOW: &[&str] = &[
     // wrappers
+    "helios_ask",
     "helios_repo_summary",
     "helios_outline_first",
     "helios_doc_drill",
+    #[cfg(feature = "wrappers-semantic")]
     "helios_semantic_filter",
     "helios_git_summary",
     "helios_symbol_card",
@@ -251,11 +257,7 @@ pub fn trim_rpc_response_wire(json_line: &str, max_bytes: usize) -> String {
 /// `StripDescMode`. `inputSchema` is always preserved.
 ///
 /// Best-effort: parse failure ⇒ pass-through.
-pub fn trim_tools_list_wire(
-    json_line: &str,
-    profile: Profile,
-    strip: StripDescMode,
-) -> String {
+pub fn trim_tools_list_wire(json_line: &str, profile: Profile, strip: StripDescMode) -> String {
     // Full + None = no-op; bail before paying the parse cost.
     if profile == Profile::Full && matches!(strip, StripDescMode::None) {
         return json_line.to_string();
@@ -357,7 +359,9 @@ mod tests {
         let parsed: JsonValue = serde_json::from_str(&out).unwrap();
         assert_eq!(parsed["jsonrpc"], "2.0");
         assert_eq!(parsed["id"], 1);
-        let desc = parsed["result"]["tools"][0]["description"].as_str().unwrap();
+        let desc = parsed["result"]["tools"][0]["description"]
+            .as_str()
+            .unwrap();
         assert!(desc.starts_with("AAA"));
         assert!(desc.contains("[+"));
     }
@@ -385,9 +389,11 @@ mod tests {
         // deliberately drops `helios_git_summary` (heavy: AST-diffs
         // the whole tree) — confirm only the intended subset.
         let minimal_keeps: &[&str] = &[
+            "helios_ask",
             "helios_repo_summary",
             "helios_outline_first",
             "helios_doc_drill",
+            #[cfg(feature = "wrappers-semantic")]
             "helios_semantic_filter",
             "helios_symbol_card",
         ];
@@ -469,10 +475,7 @@ mod tests {
         let tools = parsed["result"]["tools"].as_array().unwrap();
         // Standard allows helios_lsp_definition + heliosdb_query +
         // helios_repo_summary, drops helios_lsp_rename_apply.
-        let names: Vec<&str> = tools
-            .iter()
-            .map(|t| t["name"].as_str().unwrap())
-            .collect();
+        let names: Vec<&str> = tools.iter().map(|t| t["name"].as_str().unwrap()).collect();
         assert!(names.contains(&"helios_lsp_definition"));
         assert!(names.contains(&"heliosdb_query"));
         assert!(names.contains(&"helios_repo_summary"));
@@ -552,7 +555,9 @@ mod tests {
         .to_string();
         let out = trim_tools_list_wire(&body, Profile::Full, StripDescMode::ShortenTo(9));
         let parsed: JsonValue = serde_json::from_str(&out).unwrap();
-        let d = parsed["result"]["tools"][0]["description"].as_str().unwrap();
+        let d = parsed["result"]["tools"][0]["description"]
+            .as_str()
+            .unwrap();
         // Should back off to 2 full emoji = 8 bytes (≤ 9), never panic.
         assert!(d.starts_with("💰💰"));
         assert!(d.len() <= 9);

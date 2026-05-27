@@ -249,15 +249,15 @@ pub const MEGA_TOOL_NAME: &str = "helios";
 /// payload stays under ~500 bytes regardless of how many sub-actions
 /// the plugin and engine expose.
 pub fn mega_tool_descriptor() -> JsonValue {
+    let plugin_actions = plugin_action_names().join(", ");
     json!({
         "name": MEGA_TOOL_NAME,
-        "description": "One-tool gateway to the heliosdb-codekb MCP. \
-            Call with {action: \"<name>\", args: {...}}. Available actions: \
-            repo_summary, outline_first, doc_drill, semantic_filter, git_summary, \
-            symbol_card (plugin wrappers); plus passthrough to any engine tool by \
+        "description": format!("One-tool gateway to the heliosdb-codekb MCP. \
+            Call with {{action: \"<name>\", args: {{...}}}}. Available plugin actions: \
+            {plugin_actions}; plus passthrough to any engine tool by \
             short name (e.g. action=\"lsp_definition\", \"graphrag_search\", \
             \"query\", \"ast_diff\"). Use action=\"list_actions\" to fetch the \
-            full per-action arg schema catalogue on demand.",
+            full per-action arg schema catalogue on demand."),
         "inputSchema": {
             "type": "object",
             "required": ["action"],
@@ -273,6 +273,13 @@ pub fn mega_tool_descriptor() -> JsonValue {
             }
         }
     })
+}
+
+fn plugin_action_names() -> Vec<&'static str> {
+    PLUGIN_TOOLS
+        .iter()
+        .map(|tool| tool.name.trim_start_matches("helios_"))
+        .collect()
 }
 
 /// Translate a plugin wrapper or engine tool name into the
@@ -293,9 +300,11 @@ pub fn mega_tool_descriptor() -> JsonValue {
 pub fn resolve_action_name(action: &str) -> Option<&'static str> {
     match action {
         // Plugin wrappers (drop the `helios_` prefix).
+        "ask" => Some("helios_ask"),
         "repo_summary" => Some("helios_repo_summary"),
         "outline_first" => Some("helios_outline_first"),
         "doc_drill" => Some("helios_doc_drill"),
+        #[cfg(feature = "wrappers-semantic")]
         "semantic_filter" => Some("helios_semantic_filter"),
         "git_summary" => Some("helios_git_summary"),
         "symbol_card" => Some("helios_symbol_card"),
@@ -333,15 +342,36 @@ pub fn list_actions_payload() -> JsonValue {
     // then for any engine-action call, the engine will validate the
     // args at dispatch time.
     let engine_actions = &[
-        ("query", "Read-only SQL query against the embedded engine. args: {sql: string}"),
-        ("hybrid_search", "BM25 + HNSW fusion over a user table. args: {table, query, k?}"),
-        ("graphrag_search", "Seed-text BFS expand. args: {seed_text, hops?, limit?, seed_kinds?, edge_kinds?}"),
-        ("lsp_definition", "Symbol definition lookup. args: {name, hint_file?, hint_kind?}"),
-        ("lsp_references", "All references to a symbol. args: {symbol_id}"),
-        ("lsp_call_hierarchy", "Caller/callee traversal. args: {symbol_id, direction, depth}"),
+        (
+            "query",
+            "Read-only SQL query against the embedded engine. args: {sql: string}",
+        ),
+        (
+            "hybrid_search",
+            "BM25 + HNSW fusion over a user table. args: {table, query, k?}",
+        ),
+        (
+            "graphrag_search",
+            "Seed-text BFS expand. args: {seed_text, hops?, limit?, seed_kinds?, edge_kinds?}",
+        ),
+        (
+            "lsp_definition",
+            "Symbol definition lookup. args: {name, hint_file?, hint_kind?}",
+        ),
+        (
+            "lsp_references",
+            "All references to a symbol. args: {symbol_id}",
+        ),
+        (
+            "lsp_call_hierarchy",
+            "Caller/callee traversal. args: {symbol_id, direction, depth}",
+        ),
         ("lsp_hover", "Signature + docstring. args: {symbol_id}"),
         ("lsp_document_symbols", "Symbols in one file. args: {path}"),
-        ("ast_diff", "AST-level diff between branches/commits. args: {file, at_a, at_b}"),
+        (
+            "ast_diff",
+            "AST-level diff between branches/commits. args: {file, at_a, at_b}",
+        ),
     ];
     for (a, d) in engine_actions {
         entries.push(json!({"action": a, "description": d, "input_schema": "see engine tool"}));
@@ -403,6 +433,12 @@ pub fn wrap_call_error(message: impl Into<String>) -> JsonValue {
 /// set of plugin tools.
 pub const PLUGIN_TOOLS: &[ToolDesc] = &[
     ToolDesc {
+        name: "helios_ask",
+        description: "Question router: returns a compact answer-card with evidence.",
+        input_schema: ask_schema,
+        handler: ask_handler,
+    },
+    ToolDesc {
         name: "helios_repo_summary",
         description: "PageRank-ranked file index w/ top symbols.",
         input_schema: repo_summary_schema,
@@ -420,6 +456,7 @@ pub const PLUGIN_TOOLS: &[ToolDesc] = &[
         input_schema: doc_drill_schema,
         handler: doc_drill_handler,
     },
+    #[cfg(feature = "wrappers-semantic")]
     ToolDesc {
         name: "helios_semantic_filter",
         description: "Filtered KNN: semantic + lang/kind/path predicates.",
@@ -444,6 +481,32 @@ pub const PLUGIN_TOOLS: &[ToolDesc] = &[
 // Schema builders (kept as fns so the table can stay `const`)
 // ---------------------------------------------------------------------------
 
+fn ask_schema() -> JsonValue {
+    json!({
+        "type": "object",
+        "required": ["question"],
+        "properties": {
+            "question": {
+                "type": "string",
+                "description": "Natural-language repository question to route through the smallest applicable CodeKB wrapper."
+            },
+            "mode": {
+                "type": "string",
+                "enum": ["answer", "audit", "edit", "navigate"],
+                "default": "answer",
+                "description": "Intent hint. answer returns compact evidence; edit favors exact paths/lines; audit favors broader coverage."
+            },
+            "budget_tokens": {
+                "type": "integer",
+                "default": 1500,
+                "minimum": 200,
+                "maximum": 8000,
+                "description": "Approximate response budget. The server returns snippets/evidence inside this budget instead of arbitrary byte truncation."
+            }
+        }
+    })
+}
+
 fn repo_summary_schema() -> JsonValue {
     json!({
         "type": "object",
@@ -465,6 +528,13 @@ fn repo_summary_schema() -> JsonValue {
                 "type": "array",
                 "items": { "type": "string" },
                 "description": "Optional projection on per-file cards. Choices: path, pagerank, top_symbols. Omit for all."
+            },
+            "budget_tokens": {
+                "type": "integer",
+                "default": 1200,
+                "minimum": 200,
+                "maximum": 8000,
+                "description": "Approximate response budget for the answer_card/evidence."
             }
         }
     })
@@ -476,7 +546,8 @@ fn outline_first_schema() -> JsonValue {
         "required": ["query"],
         "properties": {
             "query": { "type": "string", "description": "Seed text matched against DocSection titles + text." },
-            "max_sections": { "type": "integer", "default": 20, "minimum": 1, "maximum": 100 }
+            "max_sections": { "type": "integer", "default": 20, "minimum": 1, "maximum": 100 },
+            "budget_tokens": { "type": "integer", "default": 1200, "minimum": 200, "maximum": 8000 }
         }
     })
 }
@@ -487,11 +558,13 @@ fn doc_drill_schema() -> JsonValue {
         "required": ["section_id"],
         "properties": {
             "section_id": { "type": "integer", "description": "node_id of the DocSection (from helios_outline_first)." },
-            "max_chunks": { "type": "integer", "default": 10, "minimum": 1, "maximum": 50 }
+            "max_chunks": { "type": "integer", "default": 10, "minimum": 1, "maximum": 50 },
+            "budget_tokens": { "type": "integer", "default": 1500, "minimum": 200, "maximum": 12000 }
         }
     })
 }
 
+#[cfg(feature = "wrappers-semantic")]
 fn semantic_filter_schema() -> JsonValue {
     json!({
         "type": "object",
@@ -501,7 +574,8 @@ fn semantic_filter_schema() -> JsonValue {
             "k": { "type": "integer", "default": 5, "minimum": 1, "maximum": 50 },
             "where_lang": { "type": "string", "description": "Filter by symbol language (rust, python, …)." },
             "where_kind": { "type": "string", "description": "Filter by symbol kind (function, struct, …)." },
-            "where_path_glob": { "type": "string", "description": "Filter by file-path glob (e.g. src/storage/%)." }
+            "where_path_glob": { "type": "string", "description": "Filter by file-path glob (e.g. src/storage/%)." },
+            "budget_tokens": { "type": "integer", "default": 1200, "minimum": 200, "maximum": 8000 }
         }
     })
 }
@@ -517,7 +591,8 @@ fn git_summary_schema() -> JsonValue {
                 "type": "array",
                 "items": { "type": "string" },
                 "description": "Optional file-path filter. Empty = diff the whole tree."
-            }
+            },
+            "budget_tokens": { "type": "integer", "default": 1500, "minimum": 200, "maximum": 12000 }
         }
     })
 }
@@ -537,7 +612,8 @@ fn symbol_card_schema() -> JsonValue {
                 "type": "array",
                 "items": { "type": "string" },
                 "description": "Optional projection — when set, only these fields are returned. Choices: qualified, signature, doc1l, llm_summary, file, line, callers, callees. Omit for all fields."
-            }
+            },
+            "budget_tokens": { "type": "integer", "default": 1200, "minimum": 200, "maximum": 8000 }
         }
     })
 }
@@ -589,8 +665,12 @@ fn arg_field_set(args: &JsonValue) -> Option<std::collections::HashSet<String>> 
 /// the input passes through unchanged. Unknown field names in the
 /// set are simply absent from the output.
 fn project(v: JsonValue, fields: Option<&std::collections::HashSet<String>>) -> JsonValue {
-    let Some(fields) = fields else { return v; };
-    let Some(obj) = v.as_object() else { return v; };
+    let Some(fields) = fields else {
+        return v;
+    };
+    let Some(obj) = v.as_object() else {
+        return v;
+    };
     let mut out = serde_json::Map::with_capacity(fields.len());
     for (k, val) in obj {
         if fields.contains(k) {
@@ -598,6 +678,107 @@ fn project(v: JsonValue, fields: Option<&std::collections::HashSet<String>>) -> 
         }
     }
     JsonValue::Object(out)
+}
+
+fn arg_budget_tokens(args: &JsonValue, default: usize) -> usize {
+    arg_int(args, "budget_tokens", default as i64).clamp(200, 12_000) as usize
+}
+
+fn budget_bytes(args: &JsonValue, default_tokens: usize) -> usize {
+    arg_budget_tokens(args, default_tokens).saturating_mul(4)
+}
+
+fn shorten_chars(s: &str, max_bytes: usize) -> (String, usize) {
+    if s.len() <= max_bytes {
+        return (s.to_string(), 0);
+    }
+    let mut cut = max_bytes;
+    while cut > 0 && !s.is_char_boundary(cut) {
+        cut -= 1;
+    }
+    (s[..cut].to_string(), s.len().saturating_sub(cut))
+}
+
+fn attach_answer_card(
+    mut payload: JsonValue,
+    kind: &str,
+    summary: impl Into<String>,
+    evidence: Vec<JsonValue>,
+    args: &JsonValue,
+    default_budget_tokens: usize,
+    omitted: Vec<JsonValue>,
+) -> JsonValue {
+    let budget = arg_budget_tokens(args, default_budget_tokens);
+    let card = json!({
+        "kind": kind,
+        "summary": summary.into(),
+        "budget_tokens": budget,
+        "evidence": evidence,
+        "omitted": omitted,
+    });
+    if let Some(obj) = payload.as_object_mut() {
+        obj.insert(
+            "schema".to_string(),
+            JsonValue::String("helios.answer_card.v1".to_string()),
+        );
+        obj.insert("answer_card".to_string(), card);
+    }
+    payload
+}
+
+fn first_backtick_term(question: &str) -> Option<String> {
+    let mut parts = question.split('`');
+    let _before = parts.next()?;
+    let term = parts.next()?.trim();
+    if term.is_empty() {
+        None
+    } else {
+        Some(term.to_string())
+    }
+}
+
+fn likely_symbol_term(question: &str) -> Option<String> {
+    if let Some(term) = first_backtick_term(question) {
+        return Some(term);
+    }
+    question
+        .split(|c: char| !(c.is_ascii_alphanumeric() || c == '_' || c == ':'))
+        .filter(|s| !s.is_empty())
+        .find(|s| {
+            s.contains("::")
+                || s.chars().any(|c| c == '_')
+                || s.chars().any(|c| c.is_ascii_uppercase())
+        })
+        .map(str::to_string)
+}
+
+fn looks_like_architecture_question(q: &str) -> bool {
+    let q = q.to_ascii_lowercase();
+    [
+        "architecture",
+        "overview",
+        "layout",
+        "modules",
+        "structure",
+        "where does this codebase",
+    ]
+    .iter()
+    .any(|needle| q.contains(needle))
+}
+
+fn looks_like_doc_question(q: &str) -> bool {
+    let q = q.to_ascii_lowercase();
+    [
+        "doc",
+        "docs",
+        "readme",
+        "according",
+        "guide",
+        "explain",
+        "how does",
+    ]
+    .iter()
+    .any(|needle| q.contains(needle))
 }
 
 /// Extract a string column from a Tuple row at `idx`. Returns "" for
@@ -619,6 +800,15 @@ fn tuple_f64(row: &heliosdb_nano::Tuple, idx: usize) -> f64 {
     }
 }
 
+fn tuple_int(row: &heliosdb_nano::Tuple, idx: usize) -> Option<i64> {
+    match row.get(idx) {
+        Some(heliosdb_nano::Value::Int8(i)) => Some(*i),
+        Some(heliosdb_nano::Value::Int4(i)) => Some(*i as i64),
+        Some(heliosdb_nano::Value::Int2(i)) => Some(*i as i64),
+        _ => None,
+    }
+}
+
 /// SQL string literal escape — single-quote replacement only.
 fn sql_lit(s: &str) -> String {
     format!("'{}'", s.replace('\'', "''"))
@@ -636,6 +826,85 @@ fn table_exists(db: &EmbeddedDatabase, table: &str) -> bool {
 }
 
 // ---------------------------------------------------------------------------
+// Handlers — `helios_ask`
+// ---------------------------------------------------------------------------
+
+fn ask_handler(db: &EmbeddedDatabase, args: &JsonValue) -> Result<JsonValue, String> {
+    let question = arg_str(args, "question")?;
+    let mode = arg_str_opt(args, "mode").unwrap_or("answer");
+    let budget = arg_budget_tokens(args, 1500);
+
+    let (route, routed_args, result) = if looks_like_architecture_question(question) {
+        let routed_args = json!({
+            "detail": "file_index",
+            "limit": 20,
+            "budget_tokens": budget,
+        });
+        let result = repo_summary_handler(db, &routed_args)?;
+        ("repo_summary", routed_args, result)
+    } else if let Some(symbol) = likely_symbol_term(question) {
+        let routed_args = json!({
+            "qualified_name": symbol,
+            "max_callers": if mode == "audit" { 8 } else { 3 },
+            "max_callees": if mode == "audit" { 8 } else { 3 },
+            "budget_tokens": budget,
+        });
+        let result = symbol_card_handler(db, &routed_args)?;
+        if result.get("status").and_then(|v| v.as_str()) == Some("not_found")
+            && looks_like_doc_question(question)
+        {
+            let fallback_args = json!({
+                "query": question,
+                "max_sections": 8,
+                "budget_tokens": budget,
+            });
+            let fallback = outline_first_handler(db, &fallback_args)?;
+            ("outline_first", fallback_args, fallback)
+        } else {
+            ("symbol_card", routed_args, result)
+        }
+    } else {
+        let routed_args = json!({
+            "query": question,
+            "max_sections": if mode == "audit" { 12 } else { 8 },
+            "budget_tokens": budget,
+        });
+        let result = outline_first_handler(db, &routed_args)?;
+        ("outline_first", routed_args, result)
+    };
+
+    let evidence = result
+        .get("answer_card")
+        .and_then(|c| c.get("evidence"))
+        .and_then(|e| e.as_array())
+        .cloned()
+        .unwrap_or_default();
+    let summary = result
+        .get("answer_card")
+        .and_then(|c| c.get("summary"))
+        .and_then(|s| s.as_str())
+        .map(str::to_string)
+        .unwrap_or_else(|| format!("Routed question through {route}."));
+
+    let payload = json!({
+        "question": question,
+        "mode": mode,
+        "route": route,
+        "routed_args": routed_args,
+        "result": result,
+    });
+    Ok(attach_answer_card(
+        payload,
+        "ask",
+        summary,
+        evidence,
+        args,
+        1500,
+        Vec::new(),
+    ))
+}
+
+// ---------------------------------------------------------------------------
 // Handlers — `helios_repo_summary`
 // ---------------------------------------------------------------------------
 
@@ -645,18 +914,29 @@ fn repo_summary_handler(db: &EmbeddedDatabase, args: &JsonValue) -> Result<JsonV
     let fields = arg_field_set(args);
 
     if !table_exists(db, "_hdb_plugin_repomap_cards") {
-        return Ok(json!({
+        let payload = json!({
             "status": "cards_not_built",
             "message": "_hdb_plugin_repomap_cards not present. Re-run `heliosdb-codekb-mcp ingest --source <root>` after Layer 3 (distill) lands to populate the table.",
             "files": []
-        }));
+        });
+        return Ok(attach_answer_card(
+            payload,
+            "repo_summary",
+            "RepoMap cards are not built yet; run ingest to populate compact file summaries.",
+            Vec::new(),
+            args,
+            1200,
+            Vec::new(),
+        ));
     }
 
     let sql = format!(
         "SELECT path, pagerank, top_symbols FROM _hdb_plugin_repomap_cards \
          ORDER BY pagerank DESC LIMIT {limit}"
     );
-    let rows = db.query(&sql, &[]).map_err(|e| format!("query failed: {e}"))?;
+    let rows = db
+        .query(&sql, &[])
+        .map_err(|e| format!("query failed: {e}"))?;
 
     let mut files = Vec::with_capacity(rows.len());
     for row in &rows {
@@ -667,8 +947,8 @@ fn repo_summary_handler(db: &EmbeddedDatabase, args: &JsonValue) -> Result<JsonV
         let full = match detail {
             "minimal" => json!({ "path": path, "pagerank": pagerank }),
             "file_index" => {
-                let top: JsonValue = serde_json::from_str(&top_symbols_raw)
-                    .unwrap_or(JsonValue::Array(vec![]));
+                let top: JsonValue =
+                    serde_json::from_str(&top_symbols_raw).unwrap_or(JsonValue::Array(vec![]));
                 let trimmed = match top {
                     JsonValue::Array(arr) => arr
                         .into_iter()
@@ -691,8 +971,8 @@ fn repo_summary_handler(db: &EmbeddedDatabase, args: &JsonValue) -> Result<JsonV
             _ => {
                 // symbol_index: pass the cards through as stored
                 // (signature + doc1l per symbol).
-                let top: JsonValue = serde_json::from_str(&top_symbols_raw)
-                    .unwrap_or(JsonValue::Array(vec![]));
+                let top: JsonValue =
+                    serde_json::from_str(&top_symbols_raw).unwrap_or(JsonValue::Array(vec![]));
                 json!({
                     "path": path,
                     "pagerank": pagerank,
@@ -703,7 +983,29 @@ fn repo_summary_handler(db: &EmbeddedDatabase, args: &JsonValue) -> Result<JsonV
         files.push(project(full, fields.as_ref()));
     }
 
-    Ok(json!({ "detail": detail, "count": files.len(), "files": files }))
+    let evidence = files
+        .iter()
+        .take(8)
+        .filter_map(|f| {
+            Some(json!({
+                "path": f.get("path")?.clone(),
+                "pagerank": f.get("pagerank").cloned().unwrap_or(JsonValue::Null),
+            }))
+        })
+        .collect::<Vec<_>>();
+    let payload = json!({ "detail": detail, "count": files.len(), "files": files });
+    Ok(attach_answer_card(
+        payload,
+        "repo_summary",
+        format!(
+            "Returned {} PageRank-ranked file cards at detail={detail}.",
+            rows.len()
+        ),
+        evidence,
+        args,
+        1200,
+        Vec::new(),
+    ))
 }
 
 // ---------------------------------------------------------------------------
@@ -751,16 +1053,40 @@ fn outline_first_handler(db: &EmbeddedDatabase, args: &JsonValue) -> Result<Json
         })
         .collect();
 
-    Ok(json!({ "query": query, "count": sections.len(), "sections": sections }))
+    let evidence = sections
+        .iter()
+        .take(8)
+        .filter_map(|s| {
+            Some(json!({
+                "section_id": s.get("section_id")?.clone(),
+                "title": s.get("title").cloned().unwrap_or(JsonValue::Null),
+                "source": s.get("source").cloned().unwrap_or(JsonValue::Null),
+            }))
+        })
+        .collect::<Vec<_>>();
+    let payload = json!({ "query": query, "count": sections.len(), "sections": sections });
+    Ok(attach_answer_card(
+        payload,
+        "outline_first",
+        format!(
+            "Returned {} matching documentation sections without full chunk bodies.",
+            evidence.len()
+        ),
+        evidence,
+        args,
+        1200,
+        Vec::new(),
+    ))
 }
 
 fn doc_drill_handler(db: &EmbeddedDatabase, args: &JsonValue) -> Result<JsonValue, String> {
     let section_id = arg_int_required(args, "section_id")?;
     let max_chunks = arg_int(args, "max_chunks", 10).clamp(1, 50);
 
-    // Pull the section's title for the seed, then BFS one hop along
-    // PART_OF to its child DocChunks. The engine's `graph_rag_search`
-    // takes a text seed — use the section title we just looked up.
+    // Directly expand the requested DocSection id. The older
+    // implementation re-searched by section title, which could return
+    // the wrong chunks when headings repeated and paid an unnecessary
+    // retrieval round trip.
     let title_sql = format!(
         "SELECT title FROM _hdb_graph_nodes WHERE node_id = {section_id} AND node_kind = 'DocSection'"
     );
@@ -773,38 +1099,78 @@ fn doc_drill_handler(db: &EmbeddedDatabase, args: &JsonValue) -> Result<JsonValu
         .filter(|t| !t.is_empty())
         .ok_or_else(|| format!("no DocSection node with id {section_id}"))?;
 
-    use heliosdb_nano::graph_rag::{Direction, GraphRagOptions};
-    let opts = GraphRagOptions {
-        seed_text: title.clone(),
-        seed_kinds: vec!["DocSection".to_string()],
-        hops: 1,
-        edge_kinds: vec!["PART_OF".to_string()],
-        direction: Direction::Out,
-        limit: max_chunks as usize + 1, // +1 for the seed itself
-    };
-    let hits = db
-        .graph_rag_search(&opts)
-        .map_err(|e| format!("graph_rag_search failed: {e}"))?;
+    let chunk_sql = format!(
+        "SELECT n.node_id, n.text, n.source_ref \
+         FROM _hdb_graph_edges e \
+         JOIN _hdb_graph_nodes n ON n.node_id = e.from_node \
+         WHERE e.to_node = {section_id} \
+           AND e.edge_kind = 'PART_OF' \
+           AND n.node_kind = 'DocChunk' \
+         ORDER BY n.node_id \
+         LIMIT {max_chunks}"
+    );
+    let rows = db
+        .query(&chunk_sql, &[])
+        .map_err(|e| format!("chunk lookup failed: {e}"))?;
 
-    let chunks: Vec<JsonValue> = hits
-        .into_iter()
-        .filter(|h| h.node_kind == "DocChunk")
-        .take(max_chunks as usize)
-        .map(|h| {
-            json!({
-                "chunk_id": h.node_id,
-                "text": h.text,
-                "source": h.source_ref,
-            })
+    let mut omitted = Vec::new();
+    let mut remaining = budget_bytes(args, 1500);
+    let mut chunks: Vec<JsonValue> = Vec::with_capacity(rows.len());
+    for row in &rows {
+        let chunk_id = tuple_int(row, 0).unwrap_or_default();
+        let text = tuple_str(row, 1);
+        let source = tuple_str(row, 2);
+        let (text, dropped) = if remaining > 0 {
+            let cap = remaining.min(text.len());
+            let (out, dropped) = shorten_chars(&text, cap);
+            remaining = remaining.saturating_sub(out.len());
+            (out, dropped)
+        } else {
+            (String::new(), text.len())
+        };
+        if dropped > 0 {
+            omitted.push(json!({
+                "reason": "budget",
+                "chunk_id": chunk_id,
+                "bytes": dropped,
+                "open_with": { "action": "doc_drill", "args": { "section_id": section_id, "budget_tokens": 12000 } }
+            }));
+        }
+        chunks.push(json!({
+            "chunk_id": chunk_id,
+            "text": text,
+            "source": source,
+        }));
+    }
+    let evidence = chunks
+        .iter()
+        .take(8)
+        .filter_map(|c| {
+            Some(json!({
+                "chunk_id": c.get("chunk_id")?.clone(),
+                "source": c.get("source").cloned().unwrap_or(JsonValue::Null),
+            }))
         })
-        .collect();
+        .collect::<Vec<_>>();
 
-    Ok(json!({
+    let payload = json!({
         "section_id": section_id,
         "title": title,
         "count": chunks.len(),
         "chunks": chunks,
-    }))
+    });
+    Ok(attach_answer_card(
+        payload,
+        "doc_drill",
+        format!(
+            "Expanded DocSection {section_id} into {} child chunks.",
+            rows.len()
+        ),
+        evidence,
+        args,
+        1500,
+        omitted,
+    ))
 }
 
 // ---------------------------------------------------------------------------
@@ -816,16 +1182,11 @@ fn semantic_filter_handler(_db: &EmbeddedDatabase, _args: &JsonValue) -> Result<
     // Placeholder until the engine's `vector-persist` feature publishes
     // the stable `PersistentVectorIndex::open(db, "code_symbols")`
     // path. Adoption tracked in NANO_PERSISTENT_PQ_HNSW_ADOPTION.md.
-    Err("helios_semantic_filter: not yet wired — pending engine release of \
+    Err(
+        "helios_semantic_filter: not yet wired — pending engine release of \
          `vector-persist` on crates.io. Track via NANO_PERSISTENT_PQ_HNSW_ADOPTION.md."
-        .to_string())
-}
-
-#[cfg(not(feature = "wrappers-semantic"))]
-fn semantic_filter_handler(_db: &EmbeddedDatabase, _args: &JsonValue) -> Result<JsonValue, String> {
-    Err("helios_semantic_filter: compile with `--features wrappers-semantic` to enable. \
-         Requires engine feature `vector-persist`."
-        .to_string())
+            .to_string(),
+    )
 }
 
 // ---------------------------------------------------------------------------
@@ -902,7 +1263,14 @@ fn git_summary_handler(db: &EmbeddedDatabase, args: &JsonValue) -> Result<JsonVa
         // shows it useful.
     }
 
-    Ok(json!({
+    let evidence = added
+        .iter()
+        .chain(removed.iter())
+        .chain(moved.iter())
+        .take(12)
+        .cloned()
+        .collect::<Vec<_>>();
+    let payload = json!({
         "commit_a": commit_a,
         "commit_b": commit_b,
         "scanned_paths": targets.len(),
@@ -911,7 +1279,19 @@ fn git_summary_handler(db: &EmbeddedDatabase, args: &JsonValue) -> Result<JsonVa
         "removed": removed,
         "moved": moved,
         "signature_changed": signature_changed,
-    }))
+    });
+    Ok(attach_answer_card(
+        payload,
+        "git_summary",
+        format!(
+            "Scanned {} paths and returned structural AST changes.",
+            targets.len()
+        ),
+        evidence,
+        args,
+        1500,
+        Vec::new(),
+    ))
 }
 
 // ---------------------------------------------------------------------------
@@ -940,19 +1320,37 @@ fn symbol_card_handler(db: &EmbeddedDatabase, args: &JsonValue) -> Result<JsonVa
     let defs = match db.lsp_definition(&bare, &hint) {
         Ok(d) => d,
         Err(_) => {
-            return Ok(json!({
+            let payload = json!({
                 "status": "not_found",
                 "query": qualified,
                 "message": "code-graph tables not yet built — run `heliosdb-codekb-mcp ingest --source <root>` first."
-            }));
+            });
+            return Ok(attach_answer_card(
+                payload,
+                "symbol_card",
+                "Code graph tables are not built yet; run ingest before symbol lookup.",
+                Vec::new(),
+                args,
+                1200,
+                Vec::new(),
+            ));
         }
     };
     let Some(def) = defs.into_iter().next() else {
-        return Ok(json!({
+        let payload = json!({
             "status": "not_found",
             "query": qualified,
             "message": "no definition found — try a qualified name or check the symbol exists in the indexed KB."
-        }));
+        });
+        return Ok(attach_answer_card(
+            payload,
+            "symbol_card",
+            format!("No definition found for `{qualified}`."),
+            Vec::new(),
+            args,
+            1200,
+            Vec::new(),
+        ));
     };
 
     // Distilled doc1l + Phase-2 LLM summary from Layer 3 if present;
@@ -990,7 +1388,14 @@ fn symbol_card_handler(db: &EmbeddedDatabase, args: &JsonValue) -> Result<JsonVa
             doc1l = h
                 .doc
                 .as_deref()
-                .map(|d| d.split('\n').next().unwrap_or(d).chars().take(160).collect())
+                .map(|d| {
+                    d.split('\n')
+                        .next()
+                        .unwrap_or(d)
+                        .chars()
+                        .take(160)
+                        .collect()
+                })
                 .unwrap_or_default();
         }
     }
@@ -1030,7 +1435,39 @@ fn symbol_card_handler(db: &EmbeddedDatabase, args: &JsonValue) -> Result<JsonVa
         "callers": callers,
         "callees": callees,
     });
-    Ok(project(full, arg_field_set(args).as_ref()))
+    let projected = project(full, arg_field_set(args).as_ref());
+    let evidence = vec![json!({
+        "qualified": projected.get("qualified").cloned().unwrap_or(JsonValue::Null),
+        "path": projected.get("file").cloned().unwrap_or(JsonValue::Null),
+        "line": projected.get("line").cloned().unwrap_or(JsonValue::Null),
+    })];
+    let summary = projected
+        .get("llm_summary")
+        .and_then(|v| v.as_str())
+        .filter(|s| !s.is_empty())
+        .or_else(|| {
+            projected
+                .get("doc1l")
+                .and_then(|v| v.as_str())
+                .filter(|s| !s.is_empty())
+        })
+        .map(str::to_string)
+        .unwrap_or_else(|| {
+            let q = projected
+                .get("qualified")
+                .and_then(|v| v.as_str())
+                .unwrap_or(qualified);
+            format!("Returned compact symbol card for `{q}`.")
+        });
+    Ok(attach_answer_card(
+        projected,
+        "symbol_card",
+        summary,
+        evidence,
+        args,
+        1200,
+        Vec::new(),
+    ))
 }
 
 // ---------------------------------------------------------------------------
@@ -1043,10 +1480,8 @@ mod tests {
 
     #[test]
     fn plugin_tools_match_mcp_trim_wrapper_names() {
-        let here: std::collections::HashSet<&str> =
-            PLUGIN_TOOLS.iter().map(|t| t.name).collect();
-        let other: std::collections::HashSet<&str> =
-            wrapper_tool_names().iter().copied().collect();
+        let here: std::collections::HashSet<&str> = PLUGIN_TOOLS.iter().map(|t| t.name).collect();
+        let other: std::collections::HashSet<&str> = wrapper_tool_names().iter().copied().collect();
         assert_eq!(
             here, other,
             "PLUGIN_TOOLS and mcp_trim::wrapper_tool_names() must list the same names"
@@ -1057,7 +1492,11 @@ mod tests {
     fn each_tool_has_valid_schema() {
         for t in PLUGIN_TOOLS {
             let s = (t.input_schema)();
-            assert_eq!(s["type"], "object", "{}: schema type must be object", t.name);
+            assert_eq!(
+                s["type"], "object",
+                "{}: schema type must be object",
+                t.name
+            );
             assert!(
                 s.get("properties").is_some(),
                 "{}: schema needs `properties`",
@@ -1110,14 +1549,21 @@ mod tests {
         let td = tempfile::tempdir().unwrap();
         let db = EmbeddedDatabase::new(td.path()).unwrap();
         let r = dispatch(&db, "heliosdb_query", &json!({"sql": "SELECT 1"}));
-        assert!(r.is_none(), "engine tool name must not match plugin dispatch");
+        assert!(
+            r.is_none(),
+            "engine tool name must not match plugin dispatch"
+        );
     }
 
     #[test]
     fn dispatch_routes_symbol_card_call() {
         let td = tempfile::tempdir().unwrap();
         let db = EmbeddedDatabase::new(td.path()).unwrap();
-        let r = dispatch(&db, "helios_symbol_card", &json!({"qualified_name": "nonexistent"}));
+        let r = dispatch(
+            &db,
+            "helios_symbol_card",
+            &json!({"qualified_name": "nonexistent"}),
+        );
         assert!(r.is_some(), "plugin name must be dispatched");
         let payload = r.unwrap().unwrap();
         // Empty KB → not_found status, but no Rust panic.
@@ -1128,7 +1574,10 @@ mod tests {
     fn wrap_envelopes() {
         let ok = wrap_call_result(json!({"a": 1}));
         assert_eq!(ok["isError"], false);
-        assert!(ok["content"][0]["text"].as_str().unwrap().contains("\"a\":1"));
+        assert!(ok["content"][0]["text"]
+            .as_str()
+            .unwrap()
+            .contains("\"a\":1"));
         let err = wrap_call_error("bang");
         assert_eq!(err["isError"], true);
         assert_eq!(err["content"][0]["text"], "bang");

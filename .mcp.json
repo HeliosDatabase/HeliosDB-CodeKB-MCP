@@ -2,7 +2,12 @@
   "mcpServers": {
     "helios": {
       "command": "heliosdb-codekb-mcp",
-      "args": ["serve", "--source", "${CLAUDE_PROJECT_DIR}"]
+      "args": [
+        "serve",
+        "--source", "${CLAUDE_PROJECT_DIR}",
+        "--mega-tool",
+        "--wrapper-cache-size", "128"
+      ]
     }
   }
 }

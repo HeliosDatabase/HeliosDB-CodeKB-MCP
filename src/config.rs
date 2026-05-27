@@ -8,6 +8,8 @@
 //! [serve]
 //! profile = "standard"               # minimal | standard | full (default standard)
 //! strip_tool_descriptions = "200"    # int | "none" | "all"
+//! mega_tool = true                    # collapse tools/list to one `helios` tool
+//! wrapper_cache_size = 128            # per-process wrapper result cache
 //!
 //! [kbs."/abs/path/to/source"]
 //! mode     = "co-located"
@@ -20,9 +22,9 @@
 //! `mode = "hybrid"` to share one KB across sources.
 //!
 //! The `[serve]` section is consumed by `Commands::Serve` as a default
-//! for the `--profile` / `--strip-tool-descriptions` flags. CLI args
-//! always win; config TOML is the second-priority source; the
-//! built-in defaults (`standard` / `200`) are the last fallback.
+//! for the `--profile` / `--strip-tool-descriptions` / compact-mode
+//! flags. CLI args always win; config TOML is the second-priority
+//! source; the built-in defaults are the last fallback.
 
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
@@ -65,6 +67,13 @@ pub struct ServeConfig {
     /// Accepts an integer (cap at N bytes), `"none"`, or `"all"`.
     /// `None` ⇒ binary falls back to `"200"`.
     pub strip_tool_descriptions: Option<String>,
+    /// Collapse the advertised tool surface to one `helios(action,args)`
+    /// gateway. `None` lets the binary choose: compact by default for
+    /// fresh installs, profile mode when an explicit profile was saved.
+    pub mega_tool: Option<bool>,
+    /// Per-process wrapper result cache capacity. `None` falls back to
+    /// 128 in mega mode and 0 in profile mode.
+    pub wrapper_cache_size: Option<usize>,
 }
 
 impl Default for Config {
@@ -221,10 +230,14 @@ mod tests {
         let mut cfg = Config::default();
         cfg.serve.profile = Some("minimal".to_string());
         cfg.serve.strip_tool_descriptions = Some("all".to_string());
+        cfg.serve.mega_tool = Some(true);
+        cfg.serve.wrapper_cache_size = Some(64);
         let s = cfg.to_toml().unwrap();
         let parsed: Config = toml::from_str(&s).unwrap();
         assert_eq!(parsed.serve.profile.as_deref(), Some("minimal"));
         assert_eq!(parsed.serve.strip_tool_descriptions.as_deref(), Some("all"));
+        assert_eq!(parsed.serve.mega_tool, Some(true));
+        assert_eq!(parsed.serve.wrapper_cache_size, Some(64));
     }
 
     #[test]
@@ -236,6 +249,8 @@ mod tests {
         let parsed: Config = toml::from_str(legacy).unwrap();
         assert!(parsed.serve.profile.is_none());
         assert!(parsed.serve.strip_tool_descriptions.is_none());
+        assert!(parsed.serve.mega_tool.is_none());
+        assert!(parsed.serve.wrapper_cache_size.is_none());
     }
 
     #[test]

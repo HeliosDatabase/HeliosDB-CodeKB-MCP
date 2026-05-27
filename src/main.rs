@@ -120,16 +120,22 @@ enum Commands {
         /// the per-action schema catalogue. Implies that callers
         /// dispatch all reads through one tool name — measure both
         /// modes and pick per project.
-        #[arg(long, default_value_t = false)]
+        #[arg(long, default_value_t = false, conflicts_with = "no_mega_tool")]
         mega_tool: bool,
+
+        /// Force profile-mode tools/list even when config/defaults
+        /// would enable the one-tool gateway. Useful for debugging
+        /// and for clients that depend on per-tool JSON schemas.
+        #[arg(long, default_value_t = false)]
+        no_mega_tool: bool,
 
         /// Per-process LRU cache of wrapper-tool results. Repeated
         /// `(tool_name, args)` lookups within a single serve session
         /// short-circuit past the engine. `0` disables (default — no
         /// memory cost, no behavioural surprise). 64-256 is a good
         /// starting point for an interactive agent session.
-        #[arg(long, default_value_t = 0)]
-        wrapper_cache_size: usize,
+        #[arg(long)]
+        wrapper_cache_size: Option<usize>,
     },
 
     /// Create / configure a KB for a source path. Persists the choice
@@ -329,16 +335,17 @@ async fn main() -> Result<()> {
             profile,
             strip_tool_descriptions,
             mega_tool,
+            no_mega_tool,
             wrapper_cache_size,
         } => {
-            wrappers::set_cache_capacity(wrapper_cache_size);
             serve(
                 &source,
                 http.as_deref(),
                 max_tool_result_bytes,
                 profile.as_deref(),
                 strip_tool_descriptions.as_deref(),
-                mega_tool,
+                cli_mega_choice(mega_tool, no_mega_tool),
+                wrapper_cache_size,
             )
             .await
         }
@@ -467,13 +474,24 @@ fn build_llm_distill_opts(
     })
 }
 
+fn cli_mega_choice(mega_tool: bool, no_mega_tool: bool) -> Option<bool> {
+    if mega_tool {
+        Some(true)
+    } else if no_mega_tool {
+        Some(false)
+    } else {
+        None
+    }
+}
+
 async fn serve(
     source: &std::path::Path,
     http: Option<&str>,
     max_tool_result_bytes: usize,
     cli_profile: Option<&str>,
     cli_strip: Option<&str>,
-    mega_tool: bool,
+    cli_mega_tool: Option<bool>,
+    cli_wrapper_cache_size: Option<usize>,
 ) -> Result<()> {
     let cfg = Config::load_or_default()?;
     let spec = cfg
@@ -495,8 +513,19 @@ async fn serve(
         .unwrap_or_else(|| "200".to_string());
     let profile = mcp_trim::Profile::parse(&profile_str).map_err(|e| anyhow::anyhow!(e))?;
     let strip_desc = mcp_trim::StripDescMode::parse(&strip_str).map_err(|e| anyhow::anyhow!(e))?;
+    let mega_tool = resolve_mega_tool(cli_mega_tool, cli_profile, &cfg);
+    let wrapper_cache_size = cli_wrapper_cache_size
+        .or(cfg.serve.wrapper_cache_size)
+        .unwrap_or(if mega_tool { 128 } else { 0 });
+    wrappers::set_cache_capacity(wrapper_cache_size);
 
-    tracing::info!(kb = %spec.kb_dir.display(), profile = profile.as_str(), "opening KB");
+    tracing::info!(
+        kb = %spec.kb_dir.display(),
+        profile = profile.as_str(),
+        mega_tool,
+        wrapper_cache_size,
+        "opening KB"
+    );
     let db = Arc::new(EmbeddedDatabase::new(&spec.kb_dir).with_context(|| {
         format!(
             "failed to open EmbeddedDatabase at {}",
@@ -560,6 +589,22 @@ async fn serve(
                 .map_err(|e| anyhow::anyhow!("MCP HTTP server failed: {e}"))
         }
     }
+}
+
+fn resolve_mega_tool(cli_mega_tool: Option<bool>, cli_profile: Option<&str>, cfg: &Config) -> bool {
+    if let Some(v) = cli_mega_tool {
+        return v;
+    }
+    if let Some(v) = cfg.serve.mega_tool {
+        return v;
+    }
+    // Preserve explicit profile-mode intent. Existing users that saved
+    // [serve] profile = "minimal|standard|full" keep seeing a per-tool
+    // catalogue unless they opt into mega_tool.
+    if cli_profile.is_some() || cfg.serve.profile.is_some() {
+        return false;
+    }
+    true
 }
 
 /// Per-serve gateway config. Cheap to clone (`Copy` on the inner enums,
@@ -641,7 +686,11 @@ fn mega_tool_dispatch(
     if name != wrappers::MEGA_TOOL_NAME {
         return None;
     }
-    let args = req.params.get("arguments").cloned().unwrap_or(serde_json::Value::Null);
+    let args = req
+        .params
+        .get("arguments")
+        .cloned()
+        .unwrap_or(serde_json::Value::Null);
     let id = req.id.clone().unwrap_or(serde_json::Value::Null);
     let action = match args.get("action").and_then(|v| v.as_str()) {
         Some(a) => a.to_string(),
@@ -718,10 +767,7 @@ fn plugin_handler_error_response(id: serde_json::Value, msg: String) -> String {
 /// shape but interposes our gateway on `POST /`. The streaming
 /// transports (`/ws`, `/sse`) and discovery (`/info`) are mounted
 /// straight from the engine — buffering them would break the stream.
-fn build_http_gateway_router(
-    db: Arc<EmbeddedDatabase>,
-    cfg: GatewayCfg,
-) -> axum::Router {
+fn build_http_gateway_router(db: Arc<EmbeddedDatabase>, cfg: GatewayCfg) -> axum::Router {
     use axum::extract::{Extension, State};
     use axum::response::IntoResponse;
     use axum::routing::{get, post};
@@ -753,7 +799,9 @@ fn build_http_gateway_router(
                 if let Some(result) = wrappers::dispatch(
                     state.db.as_ref(),
                     name,
-                    req.params.get("arguments").unwrap_or(&serde_json::Value::Null),
+                    req.params
+                        .get("arguments")
+                        .unwrap_or(&serde_json::Value::Null),
                 ) {
                     match result {
                         Ok(v) => plugin_success_response(id, v),
@@ -872,7 +920,13 @@ async fn stdio_loop_with_gateway(
         //    engine. Otherwise fall through to the engine.
         let out_line = if method == "tools/call" {
             if let Some(name) = tools_call_name(&req.params) {
-                if let Some(result) = wrappers::dispatch(db, name, req.params.get("arguments").unwrap_or(&serde_json::Value::Null)) {
+                if let Some(result) = wrappers::dispatch(
+                    db,
+                    name,
+                    req.params
+                        .get("arguments")
+                        .unwrap_or(&serde_json::Value::Null),
+                ) {
                     match result {
                         Ok(v) => plugin_success_response(id, v),
                         Err(msg) => plugin_handler_error_response(id, msg),
