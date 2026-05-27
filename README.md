@@ -7,7 +7,7 @@ features) and exposes its LSP-shaped + GraphRAG tools to Claude Code,
 Cursor, Codex, Aider, and any other MCP-aware agent — over plain stdio
 JSON-RPC, no ports, no auth dance, all local.
 
-**v0.2.0 headline (qwen3-coder:30b on `/home/gpc/HDB/Full`):
+**v0.2.1 headline (qwen3-coder:30b on `/home/gpc/HDB/Full`):
 −37.2 % model tokens vs no-MCP across 15 dev questions** (full report
 in [`MCP_ECOSYSTEM_BENCHMARK_REPORT_2026-05-27.md`](./MCP_ECOSYSTEM_BENCHMARK_REPORT_2026-05-27.md)).
 Biggest single-question wins: **−76 k, −69 k, −47 k tokens** on
@@ -53,61 +53,168 @@ Use the plugin when the cross-modal / time-travel / catastrophe-prevention / ans
 
 ## Install
 
-### From crates.io (recommended)
-
-Latest release: **[v0.2.0](https://crates.io/crates/heliosdb-codekb-mcp)** (2026-05-27).
+### Step 1 — install the `heliosdb-codekb-mcp` binary
 
 ```bash
 cargo install heliosdb-codekb-mcp
-# binary: ~/.cargo/bin/heliosdb-codekb-mcp
+# binary lands at ~/.cargo/bin/heliosdb-codekb-mcp
 ```
 
-### Pre-built binary
+This is the recommended path for every platform (Linux x86_64,
+Linux aarch64, macOS Intel, macOS Apple Silicon). Latest published
+version: **[v0.2.1](https://crates.io/crates/heliosdb-codekb-mcp)**.
+First build pulls the engine (`heliosdb-nano`) and is slow (~10 min);
+subsequent updates are cached.
 
-Linux x86_64 binaries are published per release on GitHub:
-**[v0.2.0 release page](https://github.com/dimensigon/heliosdb-codekb-mcp/releases/tag/v0.2.0)**.
+<details>
+<summary>Alternative: pre-built Linux x86_64 binary (v0.1.0 — stale)</summary>
 
-| Platform | Status |
-|----------|--------|
-| Linux x86_64 | ✅ pre-built binary + crates.io |
-| macOS x86_64 (Intel) | crates.io (`cargo install`) |
-| macOS / Linux aarch64 | crates.io (`cargo install`) |
+A pre-built Linux x86_64 binary exists at the v0.1.0 release page only.
+**It is stale vs the current crates.io publish** (no v0.2.x binary
+yet), so `cargo install` is preferred when you can run it. If you
+really need a binary:
 
 ```bash
 curl -L \
-  https://github.com/dimensigon/heliosdb-codekb-mcp/releases/download/v0.2.0/heliosdb-codekb-mcp-linux-x86_64 \
-  -o /usr/local/bin/heliosdb-codekb-mcp
-chmod +x /usr/local/bin/heliosdb-codekb-mcp
+  https://github.com/dimensigon/heliosdb-codekb-mcp/releases/download/v0.1.0/heliosdb-codekb-mcp-linux-x86_64 \
+  -o ~/.local/bin/heliosdb-codekb-mcp
+chmod +x ~/.local/bin/heliosdb-codekb-mcp
 ```
 
-Verify with the matching `.sha256` from the release page.
+Verify with the matching `.sha256` from the v0.1.0 release page. Pre-
+built v0.2.x binaries are tracked at issue tk.
 
-### From source (any platform)
+</details>
+
+<details>
+<summary>Alternative: build from source</summary>
 
 ```bash
+git clone https://github.com/dimensigon/heliosdb-codekb-mcp
+cd heliosdb-codekb-mcp
 cargo build --release --features native-binary-docs
 # binary: ./target/release/heliosdb-codekb-mcp
 ```
 
-## Use as a Claude Code plugin
+</details>
 
-This repo ships a `.claude-plugin/plugin.json` manifest plus three slash
-commands (`/codekb-setup`, `/codekb-ingest`, `/codekb-status`) and a
-`codekb-pro-features` skill. Install for a single Claude Code session:
+### Step 2 — index your project
+
+Once per source-tree you want indexed:
 
 ```bash
+heliosdb-codekb-mcp init --source /abs/path/to/your/project \
+  --mode co-located --ingest
+```
+
+`co-located` puts the KB at `<project>/.helios-kb` (auto-gitignored).
+See [KB-location modes](#kb-location-modes) for `global` / `hybrid`.
+
+### Step 3 — wire it into your agent
+
+The binary is now ready. Pick your agent below.
+
+#### Claude Code (`claude-code`)
+
+**Per-project `.mcp.json`** (recommended — server scope follows the
+project automatically):
+
+Drop this at `<project>/.mcp.json`:
+
+```json
+{
+  "mcpServers": {
+    "helios": {
+      "command": "heliosdb-codekb-mcp",
+      "args": [
+        "serve",
+        "--source", "${CLAUDE_PROJECT_DIR}",
+        "--wrapper-cache-size", "128"
+      ]
+    }
+  }
+}
+```
+
+`${CLAUDE_PROJECT_DIR}` is expanded by Claude Code to the project
+root, so the same `.mcp.json` works across machines. `--mega-tool` is
+the default since v0.2.0 — fresh installs get the compact one-tool
+surface automatically. Add `--no-mega-tool` if you want the full
+multi-tool catalogue.
+
+**As a Claude Code plugin** (gets you the `/codekb-setup`,
+`/codekb-ingest`, `/codekb-status` slash commands + the
+`codekb-pro-features` skill on top of the MCP server):
+
+```bash
+# One-time install from the repo's plugin manifest
 claude --plugin-dir /abs/path/to/heliosdb-codekb-mcp
 ```
 
-Or fetch directly from a release/branch URL once distributed via a
-plugin marketplace. On first use, run `/codekb-setup` — it walks you
-through the binary install (if needed), asks whether to enable the
-optional one-time ~30 MB embeddings download, and indexes the current
-project.
+Or, after a plugin marketplace publish:
+`/plugin install heliosdb-codekb-mcp`. First run `/codekb-setup`
+walks through binary install / embeddings / ingest in one flow.
 
-The plugin's `.mcp.json` declares the MCP server with
-`--source ${CLAUDE_PROJECT_DIR}`, so the helios MCP tools follow
-whichever project Claude Code is opened in.
+#### OpenAI CODEX (`codex` CLI)
+
+Add the server to `~/.codex/config.toml`:
+
+```toml
+[mcp_servers.helios]
+command = "heliosdb-codekb-mcp"
+args = [
+  "serve",
+  "--source", "/abs/path/to/your/project",
+  "--wrapper-cache-size", "128",
+]
+```
+
+CODEX doesn't expand a `${CLAUDE_PROJECT_DIR}`-style variable, so use
+an absolute project path. To switch projects, edit the path (or run
+several named servers — `helios-foo`, `helios-bar`, …). Verify the
+server is registered with:
+
+```bash
+codex --print mcp_servers
+```
+
+Then start a session as usual; the `helios(action, args)` tool
+should appear in the tool list. If CODEX reports "MCP server not
+found", confirm `heliosdb-codekb-mcp` is on the `PATH` the
+`codex` process sees (`which heliosdb-codekb-mcp` from your shell;
+if `cargo install`-ed, `~/.cargo/bin` must be on `PATH`).
+
+#### Cursor / Continue / other MCP clients (HTTP transport)
+
+For clients that don't speak stdio:
+
+```bash
+heliosdb-codekb-mcp serve --source /abs/path \
+  --http 127.0.0.1:8765 --wrapper-cache-size 128
+```
+
+Then point the client at:
+
+| Route          | Method | Purpose                             |
+|----------------|--------|-------------------------------------|
+| `POST /`       | JSON-RPC 2.0 | Standard MCP request channel  |
+| `GET /ws`      | WebSocket upgrade | Bidirectional stream      |
+| `GET /sse`     | Server-sent events | Progress notifications  |
+| `GET /info`    | One-shot discovery + cache stats         |
+
+The HTTP gateway honours `--mega-tool`, `--profile`, and
+`--strip-tool-descriptions` the same way the stdio path does.
+
+### Step 4 — verify
+
+```bash
+heliosdb-codekb-mcp status --source /abs/path/to/your/project
+```
+
+You should see `kb-on-disk : exists` and a non-zero row count. If
+`status` reports an interrupted ingest, just re-run
+`heliosdb-codekb-mcp ingest --source <path>` — the checkpoint resumes
+from the last completed phase.
 
 ## What it is
 
@@ -164,40 +271,29 @@ This tier requires a `docling-serve` HTTP endpoint to be running
 (host-managed, or via the `helios-code-graph` plugin's bundled
 compose stack).
 
-## Quickstart
+## Day-2 operations
+
+After Install:
 
 ```bash
-# 0. Build
-cargo build --release
-BIN=$(realpath target/release/heliosdb-codekb-mcp)
+# Refresh the KB after meaningful source changes
+heliosdb-codekb-mcp ingest --source /abs/path/to/your/project
 
-# 1. Configure a KB for a source path AND do the first ingest in one shot
-$BIN init \
-    --source /home/me/my-repo --mode co-located \
-    --ingest
+# Inspect / sanity-check
+heliosdb-codekb-mcp status                              # global summary
+heliosdb-codekb-mcp status --source /abs/path           # per-KB row counts
+heliosdb-codekb-mcp status --source /abs/path \
+    --mcp-url http://127.0.0.1:8765                     # live cache stats (HTTP mode)
+heliosdb-codekb-mcp config show                         # raw TOML config
 
-# 2. Wire the MCP server into your agent.  For Claude Code (.mcp.json):
-{
-  "mcpServers": {
-    "helios": {
-      "command": "/abs/path/to/heliosdb-codekb-mcp",
-      "args": [
-        "serve", "--source", "/home/me/my-repo",
-        "--mega-tool", "--wrapper-cache-size", "128"
-      ]
-    }
-  }
-}
-
-# Or HTTP transport (Cursor / Continue / any non-stdio client):
-$BIN serve --source /home/me/my-repo --http 127.0.0.1:8765
-
-# 3. Inspect / sanity-check
-$BIN status                                           # global summary
-$BIN status --source /home/me/my-repo                 # per-KB
-$BIN status --source /home/me/my-repo \
-    --mcp-url http://127.0.0.1:8765                   # + live cache stats
-$BIN config show                                      # raw TOML
+# Re-ingest with LLM distillation (one-sentence symbol summaries via
+# a self-hosted Ollama / qwen3-coder endpoint). Opt-in; slow first
+# pass, incremental after.
+heliosdb-codekb-mcp ingest --source /abs/path \
+    --with-llm-distill \
+    --llm-distill-endpoint http://ollama:11434 \
+    --llm-distill-model qwen3-coder:30b \
+    --llm-distill-batch-size 8
 ```
 
 ## Ingest tiers
