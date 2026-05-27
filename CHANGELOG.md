@@ -4,6 +4,26 @@ Format roughly follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/);
 versions track [Semantic Versioning](https://semver.org/spec/v2.0.0.html) on the
 plugin's CLI + MCP-tool contract, NOT on the embedded engine version.
 
+## [0.2.1] — 2026-05-27
+
+Documentation-only patch on top of 0.2.0. No code changes.
+
+### Changed
+
+- `README.md` rewritten to lead with **install instructions for Claude
+  Code + OpenAI CODEX** (the two MCP-aware coding agents this plugin
+  primarily targets), each with a concrete `.mcp.json` /
+  `~/.codex/config.toml` snippet plus a one-shot copy/paste invocation.
+- Removed the broken `curl … releases/download/v0.2.0/…` instruction.
+  The v0.2.0 release was crates.io-only — no GitHub release artifact
+  existed for that tag, so the documented URL returned HTTP 404.
+  Pre-built Linux x86_64 binary still ships at the v0.1.0 GH release;
+  documented as a fallback with the honest caveat that it's stale vs
+  the published crate.
+- Install section reordered: `cargo install heliosdb-codekb-mcp` is
+  now the only first-class recommendation. Pre-built binary is
+  demoted to "alternative" with the version-staleness warning.
+
 ## [0.2.0] — 2026-05-27
 
 First substantive feature release after 0.1.0. Headline: **−37.2% model
