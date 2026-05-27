@@ -67,22 +67,24 @@ First build pulls the engine (`heliosdb-nano`) and is slow (~10 min);
 subsequent updates are cached.
 
 <details>
-<summary>Alternative: pre-built Linux x86_64 binary (v0.1.0 — stale)</summary>
+<summary>Alternative: pre-built Linux x86_64 binary</summary>
 
-A pre-built Linux x86_64 binary exists at the v0.1.0 release page only.
-**It is stale vs the current crates.io publish** (no v0.2.x binary
-yet), so `cargo install` is preferred when you can run it. If you
-really need a binary:
+A stripped Linux x86_64 binary is attached to the GitHub release for
+each tagged version. Use this if your machine doesn't have a Rust
+toolchain handy.
 
 ```bash
 curl -L \
-  https://github.com/dimensigon/heliosdb-codekb-mcp/releases/download/v0.1.0/heliosdb-codekb-mcp-linux-x86_64 \
+  https://github.com/dimensigon/heliosdb-codekb-mcp/releases/download/v0.2.1/heliosdb-codekb-mcp-linux-x86_64 \
   -o ~/.local/bin/heliosdb-codekb-mcp
 chmod +x ~/.local/bin/heliosdb-codekb-mcp
+# Optional but recommended: verify
+curl -sL https://github.com/dimensigon/heliosdb-codekb-mcp/releases/download/v0.2.1/heliosdb-codekb-mcp-linux-x86_64.sha256 \
+  | sha256sum -c -
 ```
 
-Verify with the matching `.sha256` from the v0.1.0 release page. Pre-
-built v0.2.x binaries are tracked at issue tk.
+macOS / aarch64 binaries are not yet pre-built; use
+`cargo install heliosdb-codekb-mcp` on those platforms.
 
 </details>
 
