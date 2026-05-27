@@ -61,8 +61,8 @@ struct ServerFixture {
 
 impl ServerFixture {
     /// Spawn `serve --http` with the given profile + strip mode. Pass
-    /// `None` for either to omit the flag (binary falls back to its
-    /// built-in defaults: `standard` / `200`).
+    /// `None` for both to exercise the fresh-install default: compact
+    /// mega-tool mode.
     fn spawn(profile: Option<&str>, strip: Option<&str>) -> Self {
         let td = tempfile::tempdir().expect("tempdir");
         let source = td.path().join("src");
@@ -176,6 +176,17 @@ impl Drop for ServerFixture {
         let _ = self.child.kill();
         let _ = self.child.wait();
     }
+}
+
+#[test]
+fn default_profile_collapses_to_mega_tool() {
+    let s = ServerFixture::spawn(None, None);
+    let names = s.list_tool_names();
+    assert_eq!(
+        names,
+        vec!["helios".to_string()],
+        "fresh serve defaults should advertise only the compact mega-tool; got {names:?}"
+    );
 }
 
 #[test]

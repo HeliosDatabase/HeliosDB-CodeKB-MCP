@@ -52,11 +52,13 @@ The plugin ships six **wrapper tools** that compose engine library calls into on
 
 | Question shape | Prefer this wrapper | Instead of |
 |---|---|---|
+| General repository question | `helios(action="ask", args={"question":"..."})` or `helios_ask(question="...")` | model-selected Read/Grep loops |
 | "Describe the architecture" / "what's the layout of this codebase" | `helios_repo_summary(detail="file_index")` | walking `Read` over many files |
 | Doc question ("where do the docs cover X") | `helios_outline_first(query="X")` → if needed, `helios_doc_drill(section_id)` | `helios_graphrag_search` returning whole DocChunks |
 | "Where is `X` defined / who calls it" | `helios_symbol_card(qualified_name="X")` | `Read` + `Grep` loop or `helios_lsp_definition` + `helios_lsp_references` separately |
-| "How does `X` work" (paraphrase semantic search) | `helios_semantic_filter(query="X", where_lang="rust")` | `helios_graphrag_search` with post-filter |
 | Diff / refactor audit ("what changed between A and B") | `helios_git_summary(commit_a, commit_b)` | `Bash(git diff)` |
+
+`helios_semantic_filter` is intentionally hidden unless the binary is built with `--features wrappers-semantic`; the engine filtered-KNN dependency is not in the default release yet.
 
 Each wrapper is gated by the active `--profile`. The default `standard` profile advertises all six plus a curated read-only engine subset; `minimal` drops the engine LSP/branch tools entirely; `full` is pass-through.
 

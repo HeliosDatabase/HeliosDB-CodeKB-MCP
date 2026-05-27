@@ -48,6 +48,12 @@ BIN="${HELIOS_BIN:-$(command -v heliosdb-codekb-mcp || echo "$PWD/target/release
 PROFILE="${PROFILE:-standard}"
 STRIP="${STRIP:-200}"
 MAX_TOOL_RESULT_BYTES="${MAX_TOOL_RESULT_BYTES:-0}"
+MEGA="${MEGA:-1}"
+if [[ "$MEGA" == "1" ]]; then
+  MEGA_ARGS=', "--mega-tool", "--wrapper-cache-size", "128"'
+else
+  MEGA_ARGS=""
+fi
 
 if [[ ! -d "$SRC_CORPUS" ]]; then
   echo "Source corpus not found at $SRC_CORPUS — set SRC_CORPUS=<path>." >&2
@@ -109,6 +115,7 @@ sed -e "s|@@BIN@@|$BIN|" \
     -e "s|@@PROFILE@@|$PROFILE|" \
     -e "s|@@STRIP@@|$STRIP|" \
     -e "s|@@MAX_TOOL_RESULT_BYTES@@|$MAX_TOOL_RESULT_BYTES|" \
+    -e "s|@@MEGA_ARGS@@|$MEGA_ARGS|" \
   "$(dirname "$0")/mcp-on.json.tmpl" > "$BENCH_DIR/mcp-on.json"
 
 cat <<EOF
@@ -123,6 +130,7 @@ Setup complete.
   PROFILE                = $PROFILE
   STRIP                  = $STRIP
   MAX_TOOL_RESULT_BYTES  = $MAX_TOOL_RESULT_BYTES
+  MEGA                   = $MEGA
 
 Next:
 

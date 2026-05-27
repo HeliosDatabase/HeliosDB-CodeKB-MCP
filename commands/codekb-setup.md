@@ -23,19 +23,20 @@ chmod +x ~/.local/bin/heliosdb-codekb-mcp
 
 For macOS / aarch64 / other platforms: tell the user pre-built binaries are not yet published and offer to `cargo install --git https://github.com/dimensigon/heliosdb-codekb-mcp --features native-binary-docs` instead. Confirm before running.
 
-## 2. Ask about the MCP tool-surface profile
+## 2. Ask about compact MCP mode
 
 **Prompt the user verbatim:**
 
-> Pick an MCP tool-surface profile for this project. Affects which `helios_*` / `heliosdb_*` tools are advertised to the agent — fewer tools = smaller per-turn cache cost (the tool catalogue rides along on every turn).
+> Pick an MCP tool-surface mode for this project. Compact mode is recommended: it advertises one `helios(action, args)` tool instead of a dozen per-tool schemas, which cuts the per-turn tool catalogue cost.
 >
-> - **`minimal`** — only the plugin's distilled wrappers (`helios_repo_summary`, `helios_outline_first`, `helios_doc_drill`, `helios_semantic_filter`, `helios_symbol_card`) plus `heliosdb_query`. Smallest surface; best for greenfield Claude Code sessions on this repo.
-> - **`standard`** *(default)* — wrappers + curated engine tools (read-only LSP, GraphRAG, hybrid search). Covers every canonical bench question and is the recommended starting point.
+> - **`compact`** *(default)* — one `helios` tool with actions like `ask`, `repo_summary`, `outline_first`, `doc_drill`, `symbol_card`, `git_summary`, and engine passthrough actions. Lowest token overhead; best for Claude Code, Codex, Gemini, and Ollama-style agents.
+> - **`minimal`** — individual wrapper tools plus `heliosdb_query`. Useful for clients that strongly prefer per-tool schemas.
+> - **`standard`** — wrappers + curated engine tools (read-only LSP, GraphRAG, hybrid search). Good debugging fallback.
 > - **`full`** — pass-through, every tool the engine exposes (~33). Use when integrating new tools or when an agent needs the full surface.
 >
-> Default: **standard** (you can change later by editing `~/.config/heliosdb-codekb-mcp/config.toml`'s `[serve] profile = "…"`, or by passing `--profile <mode>` in your `.mcp.json` args).
+> Default: **compact** (you can change later by editing `~/.config/heliosdb-codekb-mcp/config.toml`'s `[serve] mega_tool = true|false`, `[serve] profile = "…"`, or by passing `--mega-tool` / `--no-mega-tool` in your `.mcp.json` args).
 
-Wait for the answer. Save as `PROFILE=minimal|standard|full`. If the user picked anything other than `standard`, plan to add the `[serve]` section to their config TOML in step 7 below.
+Wait for the answer. Save as `MODE=compact|minimal|standard|full`. If the user picked `compact`, use `MEGA_TOOL=true` and `PROFILE=standard`; otherwise use `MEGA_TOOL=false` and `PROFILE=<their choice>`.
 
 ## 3. Ask about embeddings
 
@@ -78,33 +79,41 @@ If `WITH_EMBEDDINGS=no`, just the fast pass:
 heliosdb-codekb-mcp ingest --source "${CLAUDE_PROJECT_DIR}"
 ```
 
-## 7. Persist the profile (if non-default)
+## 7. Persist serve defaults
 
-If `PROFILE` is not `standard`, write it to the user-level config TOML so future `serve` invocations pick it up without `.mcp.json` edits. (Skip if `PROFILE=standard` — the binary's built-in default already matches.)
+Write the serve defaults to the user-level config TOML so future `serve` invocations pick them up without `.mcp.json` edits.
 
 ```bash
 # Use the binary's config helper to find the path, then merge the
 # [serve] section in place (toml-aware merge via a tiny Python one-liner
 # to preserve other keys).
 CONFIG_PATH=$(heliosdb-codekb-mcp config path)
-python3 - "$CONFIG_PATH" "$PROFILE" <<'PY'
+python3 - "$CONFIG_PATH" "$PROFILE" "$MEGA_TOOL" <<'PY'
 import sys, tomllib, pathlib
-p, profile = pathlib.Path(sys.argv[1]), sys.argv[2]
+p, profile, mega_tool = pathlib.Path(sys.argv[1]), sys.argv[2], sys.argv[3].lower() == "true"
 data = tomllib.loads(p.read_text()) if p.exists() else {}
-data.setdefault("serve", {})["profile"] = profile
+serve = data.setdefault("serve", {})
+serve["profile"] = profile
+serve["mega_tool"] = mega_tool
+serve["wrapper_cache_size"] = 128 if mega_tool else 0
 # tomllib has no dump; write back a minimal TOML manually.
 out = []
 for k, v in data.items():
     if isinstance(v, dict):
         out.append(f"[{k}]")
         for sk, sv in v.items():
-            out.append(f'{sk} = "{sv}"' if isinstance(sv, str) else f"{sk} = {sv}")
+            if isinstance(sv, str):
+                out.append(f'{sk} = "{sv}"')
+            elif isinstance(sv, bool):
+                out.append(f"{sk} = {'true' if sv else 'false'}")
+            else:
+                out.append(f"{sk} = {sv}")
         out.append("")
     else:
         out.insert(0, f'{k} = "{v}"' if isinstance(v, str) else f"{k} = {v}")
 p.write_text("\n".join(out).rstrip() + "\n")
 PY
-echo "wrote [serve] profile = \"$PROFILE\" to $CONFIG_PATH"
+echo "wrote [serve] profile = \"$PROFILE\", mega_tool = $MEGA_TOOL to $CONFIG_PATH"
 ```
 
 ## 8. Confirm and hand off
@@ -116,9 +125,9 @@ heliosdb-codekb-mcp status --source "${CLAUDE_PROJECT_DIR}"
 ```
 
 Tell the user:
-- The KB is ready and the `helios_*` MCP tools should appear in their next message's tool list.
+- The KB is ready and the compact `helios` MCP tool should appear in their next message's tool list.
 - If they ran `--background-quality`, paraphrase queries will improve once the child finishes (typically a few minutes); `/codekb-status` shows progress.
-- Suggest a starter query like `helios_graphrag_search` with the user's most-asked concept ("authentication", "ingest", whatever fits their project) to confirm it's working.
+- Suggest a starter query like `helios(action="ask", args={"question":"Where is authentication handled?"})`, adapted to the user's project, to confirm it's working.
 
 ## Honest caveat
 
