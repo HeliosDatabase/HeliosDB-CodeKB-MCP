@@ -137,10 +137,7 @@ pub fn build_symbol_cards(db: &EmbeddedDatabase) -> Result<DistillStats> {
             HashMap::new()
         }
     };
-    tracing::debug!(
-        "build_symbol_cards: existing.len()={}",
-        existing.len()
-    );
+    tracing::debug!("build_symbol_cards: existing.len()={}", existing.len());
 
     // Load every src file's content once, build a per-file line index
     // keyed by path so the per-symbol comment lookup is O(1).
@@ -177,7 +174,11 @@ pub fn build_symbol_cards(db: &EmbeddedDatabase) -> Result<DistillStats> {
         .filter_map(|r| {
             let id = tuple_int(r, 0)?;
             let p = tuple_str(r, 1);
-            if p.is_empty() { None } else { Some((id, p)) }
+            if p.is_empty() {
+                None
+            } else {
+                Some((id, p))
+            }
         })
         .collect();
     stats.symbols_scanned = sym_rows.len();
@@ -219,7 +220,11 @@ pub fn build_symbol_cards(db: &EmbeddedDatabase) -> Result<DistillStats> {
             .map(|lines| extract_doc1l(lines, line_start))
             .unwrap_or_default();
         let hash = blake_hex(&format!("{signature}\n{doc1l}"));
-        if existing.get(&qualified).map(|h| h == &hash).unwrap_or(false) {
+        if existing
+            .get(&qualified)
+            .map(|h| h == &hash)
+            .unwrap_or(false)
+        {
             stats.symbols_unchanged += 1;
             continue;
         }
@@ -407,14 +412,14 @@ fn cap(s: String) -> String {
 /// preserved.
 fn ascii_fallback(c: char) -> char {
     match c {
-        '\u{2013}' | '\u{2014}' => '-',                 // en-dash, em-dash
-        '\u{2018}' | '\u{2019}' => '\'',                // smart single quotes
-        '\u{201C}' | '\u{201D}' => '"',                 // smart double quotes
-        '\u{2026}' => '.',                              // ellipsis
-        '\u{00A0}' => ' ',                              // nbsp
-        '\u{2192}' | '\u{2190}' => '-',                 // arrows
-        '\u{2713}' | '\u{2705}' => '+',                 // checkmark
-        '\u{2717}' | '\u{274C}' => 'x',                 // x-mark
+        '\u{2013}' | '\u{2014}' => '-',  // en-dash, em-dash
+        '\u{2018}' | '\u{2019}' => '\'', // smart single quotes
+        '\u{201C}' | '\u{201D}' => '"',  // smart double quotes
+        '\u{2026}' => '.',               // ellipsis
+        '\u{00A0}' => ' ',               // nbsp
+        '\u{2192}' | '\u{2190}' => '-',  // arrows
+        '\u{2713}' | '\u{2705}' => '+',  // checkmark
+        '\u{2717}' | '\u{274C}' => 'x',  // x-mark
         _ => '?',
     }
 }
@@ -598,7 +603,11 @@ pub fn build_repomap_cards(db: &EmbeddedDatabase) -> Result<DistillStats> {
         );
         // Top-symbols JSON is bounded (top-10 × ~500 B) so we sanitize
         // without capping — capping would shred the JSON structure.
-        rendered.push((sanitize(path.clone()), format!("{score}"), sanitize(top_json.to_string())));
+        rendered.push((
+            sanitize(path.clone()),
+            format!("{score}"),
+            sanitize(top_json.to_string()),
+        ));
     }
 
     if !rendered.is_empty() {
@@ -833,10 +842,7 @@ pub fn build_llm_summaries(
         .query("SELECT node_id, path FROM _hdb_code_files", &[])
         .context("fetch _hdb_code_files")?;
     let repomap_rows = db
-        .query(
-            "SELECT path, pagerank FROM _hdb_plugin_repomap_cards",
-            &[],
-        )
+        .query("SELECT path, pagerank FROM _hdb_plugin_repomap_cards", &[])
         .unwrap_or_default();
 
     // qualified → (file_id, line_start, line_end). Last-wins on
@@ -845,7 +851,9 @@ pub fn build_llm_summaries(
     let mut sym_meta: HashMap<String, (i64, i64, i64)> = HashMap::with_capacity(sym_rows.len());
     for r in &sym_rows {
         let q = tuple_str(r, 0);
-        if q.is_empty() { continue; }
+        if q.is_empty() {
+            continue;
+        }
         let fid = tuple_int(r, 1).unwrap_or(0);
         let ls = tuple_int(r, 2).unwrap_or(0);
         let le = tuple_int(r, 3).unwrap_or(0);
@@ -856,7 +864,11 @@ pub fn build_llm_summaries(
         .filter_map(|r| {
             let id = tuple_int(r, 0)?;
             let p = tuple_str(r, 1);
-            if p.is_empty() { None } else { Some((id, p)) }
+            if p.is_empty() {
+                None
+            } else {
+                Some((id, p))
+            }
         })
         .collect();
     let file_pr: HashMap<String, f64> = repomap_rows
@@ -894,7 +906,9 @@ pub fn build_llm_summaries(
     let mut rows: Vec<CardSnap> = Vec::with_capacity(card_rows.len());
     for r in &card_rows {
         let qualified = tuple_str(r, 0);
-        if qualified.is_empty() { continue; }
+        if qualified.is_empty() {
+            continue;
+        }
         let (file_id, line_start, line_end) = match sym_meta.get(&qualified) {
             Some(m) => *m,
             None => continue,
@@ -953,10 +967,18 @@ pub fn build_llm_summaries(
         body_excerpt: String,
     }
     impl SymbolPromptInput for Job {
-        fn qualified(&self) -> &str { &self.qualified }
-        fn signature(&self) -> &str { &self.signature }
-        fn doc1l(&self) -> &str { &self.doc1l }
-        fn body_excerpt(&self) -> &str { &self.body_excerpt }
+        fn qualified(&self) -> &str {
+            &self.qualified
+        }
+        fn signature(&self) -> &str {
+            &self.signature
+        }
+        fn doc1l(&self) -> &str {
+            &self.doc1l
+        }
+        fn body_excerpt(&self) -> &str {
+            &self.body_excerpt
+        }
     }
 
     let mut jobs: Vec<Job> = Vec::with_capacity(rows.len());
@@ -981,7 +1003,10 @@ pub fn build_llm_summaries(
                 .map(|lines| {
                     let from = line_start.saturating_sub(1);
                     let to = (line_end).min(lines.len()).min(from + 60);
-                    lines.get(from..to).map(|s| s.join("\n")).unwrap_or_default()
+                    lines
+                        .get(from..to)
+                        .map(|s| s.join("\n"))
+                        .unwrap_or_default()
                 })
                 .unwrap_or_default()
         } else {
@@ -1040,8 +1065,15 @@ pub fn build_llm_summaries(
                 // (helps when batch_size = 1 for debugging).
                 if batch.len() == 1 {
                     let j = &batch[0];
-                    let prompt = build_prompt(&j.qualified, &j.signature, &j.doc1l, &j.body_excerpt);
-                    match call_ollama(&opts.endpoint, &opts.model, &prompt, opts.max_tokens, opts.timeout_secs) {
+                    let prompt =
+                        build_prompt(&j.qualified, &j.signature, &j.doc1l, &j.body_excerpt);
+                    match call_ollama(
+                        &opts.endpoint,
+                        &opts.model,
+                        &prompt,
+                        opts.max_tokens,
+                        opts.timeout_secs,
+                    ) {
                         Ok((s, pt, ct)) => out.push(Some((j.qualified.clone(), s, pt, ct))),
                         Err(_) => out.push(None),
                     }
@@ -1051,7 +1083,13 @@ pub fn build_llm_summaries(
                 // Per-batch token budget: per-symbol cap × batch size,
                 // plus 20 tokens of slack for numbering / newlines.
                 let budget = opts.max_tokens * batch.len() as u32 + 20;
-                match call_ollama(&opts.endpoint, &opts.model, &prompt, budget, opts.timeout_secs) {
+                match call_ollama(
+                    &opts.endpoint,
+                    &opts.model,
+                    &prompt,
+                    budget,
+                    opts.timeout_secs,
+                ) {
                     Ok((raw, pt, ct)) => {
                         let summaries = parse_batch_output(&raw, batch.len());
                         // Token accounting: split prompt + completion

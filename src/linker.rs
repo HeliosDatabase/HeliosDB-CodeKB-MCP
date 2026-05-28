@@ -141,25 +141,26 @@ pub fn link_mentions_bulk(db: &EmbeddedDatabase) -> Result<LinkerStats> {
     );
 
     let mut row_buf: Vec<(i64, i64)> = Vec::with_capacity(VALUES_PER_STATEMENT);
-    let flush_statement = |buf: &mut Vec<(i64, i64)>, w: &mut BufWriter<std::fs::File>| -> Result<()> {
-        if buf.is_empty() {
-            return Ok(());
-        }
-        // INSERT INTO _hdb_graph_edges (from_node, to_node, edge_kind, weight) VALUES (a,b,'MENTIONS',1.0), ... ;\n
-        write!(
-            w,
-            "INSERT INTO _hdb_graph_edges (from_node, to_node, edge_kind, weight) VALUES "
-        )?;
-        for (i, (from, to)) in buf.iter().enumerate() {
-            if i > 0 {
-                w.write_all(b", ")?;
+    let flush_statement =
+        |buf: &mut Vec<(i64, i64)>, w: &mut BufWriter<std::fs::File>| -> Result<()> {
+            if buf.is_empty() {
+                return Ok(());
             }
-            write!(w, "({from}, {to}, 'MENTIONS', 1.0)")?;
-        }
-        w.write_all(b";\n")?;
-        buf.clear();
-        Ok(())
-    };
+            // INSERT INTO _hdb_graph_edges (from_node, to_node, edge_kind, weight) VALUES (a,b,'MENTIONS',1.0), ... ;\n
+            write!(
+                w,
+                "INSERT INTO _hdb_graph_edges (from_node, to_node, edge_kind, weight) VALUES "
+            )?;
+            for (i, (from, to)) in buf.iter().enumerate() {
+                if i > 0 {
+                    w.write_all(b", ")?;
+                }
+                write!(w, "({from}, {to}, 'MENTIONS', 1.0)")?;
+            }
+            w.write_all(b";\n")?;
+            buf.clear();
+            Ok(())
+        };
 
     for row in db
         .query(
@@ -253,8 +254,12 @@ fn flush_batch(db: &EmbeddedDatabase, batch: &[String]) -> Result<()> {
         return Ok(());
     }
     let refs: Vec<&str> = batch.iter().map(String::as_str).collect();
-    db.execute_batch(&refs)
-        .with_context(|| format!("execute_batch({} statements) for MENTIONS bulk load", refs.len()))?;
+    db.execute_batch(&refs).with_context(|| {
+        format!(
+            "execute_batch({} statements) for MENTIONS bulk load",
+            refs.len()
+        )
+    })?;
     Ok(())
 }
 
@@ -287,8 +292,8 @@ fn contains_whole_word(haystack: &str, needle: &str) -> bool {
     let mut start = 0usize;
     while let Some(pos) = haystack[start..].find(needle) {
         let abs = start + pos;
-        let before_ok = abs == 0
-            || !is_ident_char(haystack.as_bytes().get(abs - 1).copied().unwrap_or(b' '));
+        let before_ok =
+            abs == 0 || !is_ident_char(haystack.as_bytes().get(abs - 1).copied().unwrap_or(b' '));
         let after_idx = abs + needle.len();
         let after_ok = after_idx == haystack.len()
             || !is_ident_char(haystack.as_bytes().get(after_idx).copied().unwrap_or(b' '));

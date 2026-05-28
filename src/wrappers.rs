@@ -1368,7 +1368,7 @@ fn symbol_card_handler(db: &EmbeddedDatabase, args: &JsonValue) -> Result<JsonVa
         let rows = db
             .query_params(
                 "SELECT doc1l, llm_summary FROM _hdb_plugin_symbol_cards WHERE qualified = $1",
-                &[qual.clone()],
+                std::slice::from_ref(&qual),
             )
             .or_else(|_| {
                 db.query_params(
