@@ -4,7 +4,7 @@ version = "0.2.3"
 edition = "2021"
 description = "MCP stdio server for code+docs knowledge bases, embedding HeliosDB-Nano as a library."
 license = "Apache-2.0"
-repository = "https://github.com/dimensigon/heliosdb-codekb-mcp"
+repository = "https://github.com/HeliosDatabase/HeliosDB-CodeKB-MCP"
 
 # Standalone — explicit empty workspace so Cargo doesn't try to attach
 # this crate to any parent workspace (helps when sitting next to a

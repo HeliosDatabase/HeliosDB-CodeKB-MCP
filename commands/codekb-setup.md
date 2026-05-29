@@ -16,12 +16,12 @@ If the binary is missing **and** the user is on Linux x86_64 (`uname -ms` shows 
 
 ```bash
 mkdir -p ~/.local/bin
-curl -L https://github.com/dimensigon/heliosdb-codekb-mcp/releases/download/v0.1.0/heliosdb-codekb-mcp-linux-x86_64 \
+curl -L https://github.com/HeliosDatabase/HeliosDB-CodeKB-MCP/releases/download/v0.1.0/heliosdb-codekb-mcp-linux-x86_64 \
   -o ~/.local/bin/heliosdb-codekb-mcp
 chmod +x ~/.local/bin/heliosdb-codekb-mcp
 ```
 
-For macOS / aarch64 / other platforms: tell the user pre-built binaries are not yet published and offer to `cargo install --git https://github.com/dimensigon/heliosdb-codekb-mcp --features native-binary-docs` instead. Confirm before running.
+For macOS / aarch64 / other platforms: tell the user pre-built binaries are not yet published and offer to `cargo install --git https://github.com/HeliosDatabase/HeliosDB-CodeKB-MCP --features native-binary-docs` instead. Confirm before running.
 
 ## 2. Ask about compact MCP mode
 

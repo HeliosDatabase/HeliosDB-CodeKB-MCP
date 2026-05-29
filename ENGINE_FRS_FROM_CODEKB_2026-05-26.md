@@ -13,7 +13,7 @@ status: REQUEST FOR PLANNING — please ack which ones are tractable, in what or
 # Four engine FRs blocking codekb-mcp's path to 80–90% token savings
 
 The plugin shipped four token-saving layers + a `--mega-tool` gateway
-mode (`f6a8aa9` on github.com/dimensigon/heliosdb-codekb-mcp). The
+mode (`f6a8aa9` on github.com/HeliosDatabase/HeliosDB-CodeKB-MCP). The
 mega-tool is the biggest single lever — collapses tools/list payload
 from ~6 KB to ~745 B and cuts WITH-MCP tokens by ~42% on the smoke
 corpus.
