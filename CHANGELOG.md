@@ -4,6 +4,28 @@ Format roughly follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/);
 versions track [Semantic Versioning](https://semver.org/spec/v2.0.0.html) on the
 plugin's CLI + MCP-tool contract, NOT on the embedded engine version.
 
+## [0.2.2] — 2026-05-29
+
+Release-readiness and portfolio-scale install patch.
+
+### Added
+
+- Ready-to-merge install templates under `install/` for Claude Code and
+  Codex MCP registration against a HeliosDB portfolio KB.
+- `--skip-linker` and `--skip-code-graph` ingest flags for fast first-pass
+  portfolio KB generation when full code-reference materialisation is too
+  expensive.
+- Reserved `--skip-cross-file-resolve` and `--skip-code-refs` flags for the
+  next HeliosDB-Nano code-index API. They are accepted for CLI compatibility
+  and print a warning when running against published Nano.
+- Copy-paste announcement/social launch pack under
+  `docs/ANNOUNCEMENT_PACK_v0.2.2.md`.
+
+### Changed
+
+- Lockfile refreshed to published `heliosdb-nano 3.33.0`.
+- Plugin manifest version bumped to `0.2.2`.
+
 ## [0.2.1] — 2026-05-27
 
 Documentation-only patch on top of 0.2.0. No code changes.
