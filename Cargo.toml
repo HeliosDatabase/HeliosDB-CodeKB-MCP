@@ -1,6 +1,6 @@
 [package]
 name = "heliosdb-codekb-mcp"
-version = "0.2.2"
+version = "0.2.3"
 edition = "2021"
 description = "MCP stdio server for code+docs knowledge bases, embedding HeliosDB-Nano as a library."
 license = "Apache-2.0"
@@ -74,6 +74,25 @@ ignore = "0.4"
 # can build our own GlobSet from gitattributes lines.
 globset = "0.4"
 
+# Native ingestion tier (no Docling). Pure Rust, no system deps.
+# Each is `optional` so building with --no-default-features omits
+# them entirely.
+pdf-extract = { version = "0.7", optional = true }
+docx-rs     = { version = "0.4", optional = true }
+calamine    = { version = "0.24", optional = true }
+
+# Tiny synchronous HTTP client for `status --mcp-url` (live cache
+# stats from a running `serve --http ...`) and the http_transport
+# contract test. Already in our tree via fastembed; pinned without
+# default features (no TLS — loopback only).
+ureq = { version = "2", default-features = false, features = ["json"] }
+
+# Used by `crate::linker` to stream multi-row INSERT batches to a
+# bounded-memory tempfile before the bulk-apply pass. Also pulled in
+# transitively by the engine for its own temp scratch, so we're not
+# adding a new build-graph cost — just promoting from dev-deps.
+tempfile = "3"
+
 # `setsid(2)` for the background-quality child detach + `kill(pid, 0)`
 # liveness probe for the status reporter. Direct dep; the engine
 # already pulls libc transitively.
@@ -90,25 +109,6 @@ libc = "0.2"
 # affected.
 [target.'cfg(target_os = "linux")'.dependencies]
 openssl-sys = { version = "0.9", features = ["vendored"] }
-
-# Native ingestion tier (no Docling). Pure Rust, no system deps.
-# Each is `optional` so building with --no-default-features omits
-# them entirely.
-pdf-extract = { version = "0.7", optional = true }
-docx-rs     = { version = "0.4", optional = true }
-calamine    = { version = "0.24", optional = true }
-
-# Tiny synchronous HTTP client for `status --mcp-url` (live cache
-# stats from a running `serve --http ...`) and the http_transport
-# contract test.  Already in our tree via fastembed; pinned without
-# default features (no TLS — loopback only).
-ureq = { version = "2", default-features = false, features = ["json"] }
-
-# Used by `crate::linker` to stream multi-row INSERT batches to a
-# bounded-memory tempfile before the bulk-apply pass. Also pulled in
-# transitively by the engine for its own temp scratch, so we're not
-# adding a new build-graph cost — just promoting from dev-deps.
-tempfile = "3"
 
 [dev-dependencies]
 
