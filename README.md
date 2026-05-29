@@ -75,11 +75,11 @@ toolchain handy.
 
 ```bash
 curl -L \
-  https://github.com/dimensigon/heliosdb-codekb-mcp/releases/download/v0.2.3/heliosdb-codekb-mcp-linux-x86_64 \
+  https://github.com/HeliosDatabase/HeliosDB-CodeKB-MCP/releases/download/v0.2.3/heliosdb-codekb-mcp-linux-x86_64 \
   -o ~/.local/bin/heliosdb-codekb-mcp
 chmod +x ~/.local/bin/heliosdb-codekb-mcp
 # Optional but recommended: verify
-curl -sL https://github.com/dimensigon/heliosdb-codekb-mcp/releases/download/v0.2.3/heliosdb-codekb-mcp-linux-x86_64.sha256 \
+curl -sL https://github.com/HeliosDatabase/HeliosDB-CodeKB-MCP/releases/download/v0.2.3/heliosdb-codekb-mcp-linux-x86_64.sha256 \
   | sha256sum -c -
 ```
 
@@ -92,7 +92,7 @@ macOS / aarch64 binaries are not yet pre-built; use
 <summary>Alternative: build from source</summary>
 
 ```bash
-git clone https://github.com/dimensigon/heliosdb-codekb-mcp
+git clone https://github.com/HeliosDatabase/HeliosDB-CodeKB-MCP
 cd heliosdb-codekb-mcp
 cargo build --release --features native-binary-docs
 # binary: ./target/release/heliosdb-codekb-mcp

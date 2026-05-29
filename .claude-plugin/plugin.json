@@ -5,7 +5,7 @@
   "author": {
     "name": "Dimensigon"
   },
-  "homepage": "https://github.com/dimensigon/heliosdb-codekb-mcp",
-  "repository": "https://github.com/dimensigon/heliosdb-codekb-mcp",
+  "homepage": "https://github.com/HeliosDatabase/HeliosDB-CodeKB-MCP",
+  "repository": "https://github.com/HeliosDatabase/HeliosDB-CodeKB-MCP",
   "license": "Apache-2.0"
 }
