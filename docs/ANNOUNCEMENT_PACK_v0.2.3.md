@@ -1,12 +1,12 @@
-# HeliosDB CodeKB MCP v0.2.2 Announcement Pack
+# HeliosDB CodeKB MCP v0.2.3 Announcement Pack
 
-Copy-paste-ready launch copy for `heliosdb-codekb-mcp` v0.2.2.
+Copy-paste-ready launch copy for `heliosdb-codekb-mcp` v0.2.3.
 
 Links:
 
 - crates.io: https://crates.io/crates/heliosdb-codekb-mcp
 - GitHub: https://github.com/dimensigon/heliosdb-codekb-mcp
-- Latest release: https://github.com/dimensigon/heliosdb-codekb-mcp/releases/tag/v0.2.2
+- Latest release: https://github.com/dimensigon/heliosdb-codekb-mcp/releases/tag/v0.2.3
 
 ## Clickbait Titles
 
@@ -20,7 +20,7 @@ Links:
 
 ## Short Announcement
 
-HeliosDB CodeKB MCP v0.2.2 is live.
+HeliosDB CodeKB MCP v0.2.3 is live.
 
 It turns a codebase plus docs into an MCP-accessible knowledge base for Claude
 Code, Codex, and other agent clients. Instead of dumping files into context, the
@@ -96,7 +96,7 @@ savings show up.
 MCP gives coding agents a standard way to call external tools. That means the
 same repo KB can be exposed to multiple clients, including Claude Code and Codex.
 
-In v0.2.2, CodeKB supports a compact `helios(action, args)` wrapper mode that
+In v0.2.3, CodeKB supports a compact `helios(action, args)` wrapper mode that
 keeps tool-list overhead down. Instead of exposing every operation as a large
 tool schema, the agent can call one MCP gateway and choose actions like
 `repo_summary`, `outline_first`, `doc_drill`, `graphrag_search`, or
@@ -156,7 +156,7 @@ a practical way to keep agent context under control.
 
 - crates.io: https://crates.io/crates/heliosdb-codekb-mcp
 - GitHub: https://github.com/dimensigon/heliosdb-codekb-mcp
-- Release: https://github.com/dimensigon/heliosdb-codekb-mcp/releases/tag/v0.2.2
+- Release: https://github.com/dimensigon/heliosdb-codekb-mcp/releases/tag/v0.2.3
 
 ## Reddit: r/rust
 
@@ -169,7 +169,7 @@ I built an MCP server in Rust that turns a repo into a token-saving code+docs KB
 Post:
 
 ```text
-I just published heliosdb-codekb-mcp v0.2.2.
+I just published heliosdb-codekb-mcp v0.2.3.
 
 It is a Rust MCP server that indexes a repo + docs into an embedded HeliosDB-Nano knowledge base, then exposes compact actions to Claude Code, Codex, and other MCP clients.
 
@@ -204,7 +204,7 @@ Claude Code keeps reading too many files, so I wired it to a repo knowledge base
 Post:
 
 ```text
-I released heliosdb-codekb-mcp v0.2.2 for Claude Code and other MCP clients.
+I released heliosdb-codekb-mcp v0.2.3 for Claude Code and other MCP clients.
 
 It turns your repo and docs into a local code+docs knowledge base, then gives Claude compact tools like:
 
@@ -252,7 +252,7 @@ Stop dumping your whole repo into AI context: an MCP-backed code knowledge base
 Post:
 
 ```text
-I published heliosdb-codekb-mcp v0.2.2.
+I published heliosdb-codekb-mcp v0.2.3.
 
 It is an MCP server for AI coding tools that builds a local knowledge base from a repo and docs, then returns compact context: summaries, doc outlines, GraphRAG evidence, symbol cards, AST diffs, and navigation results.
 
@@ -275,7 +275,7 @@ https://crates.io/crates/heliosdb-codekb-mcp
 ### Tweet 1
 
 ```text
-🚀 Released heliosdb-codekb-mcp v0.2.2
+🚀 Released heliosdb-codekb-mcp v0.2.3
 
 It turns your repo + docs into an MCP-accessible knowledge base for Claude Code, Codex, and other agents.
 
@@ -329,7 +329,7 @@ heliosdb-codekb-mcp serve --source . --mega-tool
 ## LinkedIn
 
 ```text
-We released HeliosDB CodeKB MCP v0.2.2.
+We released HeliosDB CodeKB MCP v0.2.3.
 
 It gives AI coding agents a persistent, local knowledge layer for codebases and documentation.
 
@@ -390,7 +390,7 @@ I am interested in feedback from people using Claude Code, Codex, Cursor, Contin
 ## Discord / Slack
 
 ```text
-🚀 HeliosDB CodeKB MCP v0.2.2 is live
+🚀 HeliosDB CodeKB MCP v0.2.3 is live
 
 It gives Claude Code, Codex, and MCP-compatible agents a local code+docs knowledge base:
 
@@ -434,9 +434,9 @@ Best for teams using Claude Code, Codex, Cursor, Continue, or any MCP-compatible
 
 ## GitHub Release Notes Addendum
 
-## v0.2.2 launch notes
+## v0.2.3 launch notes
 
-HeliosDB CodeKB MCP v0.2.2 focuses on agent installation and token-saving usage:
+HeliosDB CodeKB MCP v0.2.3 focuses on agent installation and token-saving usage:
 
 - ready-to-use Claude Code and Codex config templates
 - compact `helios(action, args)` MCP wrapper mode

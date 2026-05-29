@@ -1,7 +1,7 @@
 {
   "name": "heliosdb-codekb",
   "description": "Token-saving code+docs KB for Claude Code. Tree-sitter LSP queries, GraphRAG section retrieval, cross-modal text→code MENTIONS, time-travel branches, AST diff — all served via MCP over stdio. Powered by HeliosDB-Nano (the embedded PostgreSQL-compatible vector+graph DB) so retrieval rides on ART indexes, BM25, and HNSW instead of file walks.",
-  "version": "0.2.2",
+  "version": "0.2.3",
   "author": {
     "name": "Dimensigon"
   },

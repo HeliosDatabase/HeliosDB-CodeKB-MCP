@@ -62,7 +62,7 @@ cargo install heliosdb-codekb-mcp
 
 This is the recommended path for every platform (Linux x86_64,
 Linux aarch64, macOS Intel, macOS Apple Silicon). Latest published
-version: **[v0.2.2](https://crates.io/crates/heliosdb-codekb-mcp)**.
+version: **[v0.2.3](https://crates.io/crates/heliosdb-codekb-mcp)**.
 First build pulls the engine (`heliosdb-nano`) and is slow (~10 min);
 subsequent updates are cached.
 
@@ -75,11 +75,11 @@ toolchain handy.
 
 ```bash
 curl -L \
-  https://github.com/dimensigon/heliosdb-codekb-mcp/releases/download/v0.2.2/heliosdb-codekb-mcp-linux-x86_64 \
+  https://github.com/dimensigon/heliosdb-codekb-mcp/releases/download/v0.2.3/heliosdb-codekb-mcp-linux-x86_64 \
   -o ~/.local/bin/heliosdb-codekb-mcp
 chmod +x ~/.local/bin/heliosdb-codekb-mcp
 # Optional but recommended: verify
-curl -sL https://github.com/dimensigon/heliosdb-codekb-mcp/releases/download/v0.2.2/heliosdb-codekb-mcp-linux-x86_64.sha256 \
+curl -sL https://github.com/dimensigon/heliosdb-codekb-mcp/releases/download/v0.2.3/heliosdb-codekb-mcp-linux-x86_64.sha256 \
   | sha256sum -c -
 ```
 
