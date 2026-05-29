@@ -18,8 +18,8 @@ Release-readiness and portfolio-scale install patch.
 - Reserved `--skip-cross-file-resolve` and `--skip-code-refs` flags for the
   next HeliosDB-Nano code-index API. They are accepted for CLI compatibility
   and print a warning when running against published Nano.
-- Copy-paste announcement/social launch pack under
-  `docs/ANNOUNCEMENT_PACK_v0.2.3.md`.
+- Copy-paste announcement/social launch pack prepared in the Marketing repo
+  under `Social-Media/*/HeliosDB-CodeKB-MCP/`.
 
 ### Changed
 
