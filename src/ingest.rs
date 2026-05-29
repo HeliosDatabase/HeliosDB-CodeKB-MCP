@@ -156,6 +156,23 @@ pub struct IngestOptions {
     /// >~1 k files where a blocking embedding pass is awkward. See
     /// > `crate::quality` for the progress-file contract.
     pub background_quality: bool,
+    /// Skip the post-ingest exact text-to-symbol linker. The linker
+    /// creates high-quality cross-modal MENTIONS edges, but on very
+    /// large portfolio KBs it can dominate ingest wall time and
+    /// temporary disk usage. Code graph, doc graph, and distill cards
+    /// are still built.
+    pub skip_linker: bool,
+    /// Reserved for the next HeliosDB-Nano code-index API. Accepted for
+    /// CLI compatibility, but currently prints a warning and falls back
+    /// to the engine default when building against published Nano.
+    pub skip_cross_file_resolve: bool,
+    /// Reserved for the next HeliosDB-Nano code-index API. Accepted for
+    /// CLI compatibility, but currently prints a warning and falls back
+    /// to the engine default when building against published Nano.
+    pub skip_code_refs: bool,
+    /// Skip the engine code-graph indexer entirely. Source rows are
+    /// still stored in `src`, and docs/Markdown GraphRAG still runs.
+    pub skip_code_graph: bool,
     /// Phase 2 — opt-in LLM distillation pass. `Some(opts)` triggers
     /// `crate::distill::build_llm_summaries` after the heuristic
     /// distill phase. `None` runs heuristic-only Phase 1 distill.
@@ -396,7 +413,9 @@ pub fn ingest(db: &EmbeddedDatabase, opts: IngestOptions) -> Result<IngestSummar
     }
 
     // Step 2: run the code-graph indexer over the `src` table.
-    if summary.code_upserts > 0 {
+    if opts.skip_code_graph && summary.code_upserts > 0 {
+        eprintln!("ingest phase: code-graph skipped (--skip-code-graph)");
+    } else if summary.code_upserts > 0 {
         // Advance the resume checkpoint — we're about to enter the
         // expensive parse/write phase.
         if !is_quality_child {
@@ -418,6 +437,19 @@ pub fn ingest(db: &EmbeddedDatabase, opts: IngestOptions) -> Result<IngestSummar
             }
         );
         let code_started = Instant::now();
+        if opts.skip_cross_file_resolve {
+            eprintln!(
+                "ingest phase: --skip-cross-file-resolve requested, but published \
+                 heliosdb-nano does not expose that code-index option yet; using \
+                 engine default"
+            );
+        }
+        if opts.skip_code_refs {
+            eprintln!(
+                "ingest phase: --skip-code-refs requested, but published heliosdb-nano \
+                 does not expose that code-index option yet; using engine default"
+            );
+        }
         let cio = CodeIndexOptions {
             source_table: SOURCE_TABLE.to_string(),
             embed_bodies: opts.with_embeddings,
@@ -518,17 +550,21 @@ pub fn ingest(db: &EmbeddedDatabase, opts: IngestOptions) -> Result<IngestSummar
         // plugin's `link_mentions_bulk` does the same computation
         // but streams batches to a tempfile and applies them via
         // `execute_batch` under `SET bulk_load_mode = true`.
-        let link_started = Instant::now();
-        match crate::linker::link_mentions_bulk(db) {
-            Ok(stats) => {
-                eprintln!(
-                    "ingest phase: linker done in {:.1} s — {} MENTIONS edges added (bulk)",
-                    link_started.elapsed().as_secs_f64(),
-                    stats.mentions_added
-                );
-                summary.links = Some(stats);
+        if opts.skip_linker {
+            eprintln!("ingest phase: linker skipped (--skip-linker)");
+        } else {
+            let link_started = Instant::now();
+            match crate::linker::link_mentions_bulk(db) {
+                Ok(stats) => {
+                    eprintln!(
+                        "ingest phase: linker done in {:.1} s — {} MENTIONS edges added (bulk)",
+                        link_started.elapsed().as_secs_f64(),
+                        stats.mentions_added
+                    );
+                    summary.links = Some(stats);
+                }
+                Err(e) => tracing::warn!("link_mentions_bulk failed: {e}"),
             }
-            Err(e) => tracing::warn!("link_mentions_bulk failed: {e}"),
         }
 
         // Step 3c — pre-distillation (Layer 3). Populates the plugin's

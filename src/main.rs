@@ -203,6 +203,25 @@ enum Commands {
         /// reachable over Tailscale.
         #[arg(long, default_value_t = false)]
         with_llm_distill: bool,
+        /// Skip exact text-to-symbol MENTIONS linking. Useful for a
+        /// fast first-pass portfolio KB; leaves code/doc graph and
+        /// distill cards intact.
+        #[arg(long, default_value_t = false)]
+        skip_linker: bool,
+        /// Reserved for the next HeliosDB-Nano code-index API. Accepted
+        /// for CLI compatibility, but currently falls back to the engine
+        /// default when building against published Nano.
+        #[arg(long, default_value_t = false)]
+        skip_cross_file_resolve: bool,
+        /// Reserved for the next HeliosDB-Nano code-index API. Accepted
+        /// for CLI compatibility, but currently falls back to the engine
+        /// default when building against published Nano.
+        #[arg(long, default_value_t = false)]
+        skip_code_refs: bool,
+        /// Skip the code-graph indexer entirely. Source rows are still
+        /// stored and docs/Markdown GraphRAG still runs.
+        #[arg(long, default_value_t = false)]
+        skip_code_graph: bool,
         /// OpenAI-compatible chat endpoint (no trailing slash). Used
         /// only with `--with-llm-distill`.
         #[arg(long, default_value = "http://ollama:11434")]
@@ -270,6 +289,25 @@ enum Commands {
         /// Phase 2 LLM distillation: see `Init --with-llm-distill`.
         #[arg(long, default_value_t = false)]
         with_llm_distill: bool,
+        /// Skip exact text-to-symbol MENTIONS linking. Useful for a
+        /// fast first-pass portfolio KB; leaves code/doc graph and
+        /// distill cards intact.
+        #[arg(long, default_value_t = false)]
+        skip_linker: bool,
+        /// Reserved for the next HeliosDB-Nano code-index API. Accepted
+        /// for CLI compatibility, but currently falls back to the engine
+        /// default when building against published Nano.
+        #[arg(long, default_value_t = false)]
+        skip_cross_file_resolve: bool,
+        /// Reserved for the next HeliosDB-Nano code-index API. Accepted
+        /// for CLI compatibility, but currently falls back to the engine
+        /// default when building against published Nano.
+        #[arg(long, default_value_t = false)]
+        skip_code_refs: bool,
+        /// Skip the code-graph indexer entirely. Source rows are still
+        /// stored and docs/Markdown GraphRAG still runs.
+        #[arg(long, default_value_t = false)]
+        skip_code_graph: bool,
         #[arg(long, default_value = "http://ollama:11434")]
         llm_distill_endpoint: String,
         #[arg(long, default_value = "qwen3-coder:30b")]
@@ -360,6 +398,10 @@ async fn main() -> Result<()> {
             with_embeddings,
             background_quality,
             with_llm_distill,
+            skip_linker,
+            skip_cross_file_resolve,
+            skip_code_refs,
+            skip_code_graph,
             llm_distill_endpoint,
             llm_distill_model,
             llm_distill_concurrency,
@@ -379,6 +421,10 @@ async fn main() -> Result<()> {
                     durable_writes,
                     with_embeddings,
                     background_quality,
+                    skip_linker,
+                    skip_cross_file_resolve,
+                    skip_code_refs,
+                    skip_code_graph,
                     llm_distill: build_llm_distill_opts(
                         with_llm_distill,
                         &llm_distill_endpoint,
@@ -400,6 +446,10 @@ async fn main() -> Result<()> {
             with_embeddings,
             background_quality,
             with_llm_distill,
+            skip_linker,
+            skip_cross_file_resolve,
+            skip_code_refs,
+            skip_code_graph,
             llm_distill_endpoint,
             llm_distill_model,
             llm_distill_concurrency,
@@ -416,6 +466,10 @@ async fn main() -> Result<()> {
                 durable_writes,
                 with_embeddings,
                 background_quality,
+                skip_linker,
+                skip_cross_file_resolve,
+                skip_code_refs,
+                skip_code_graph,
                 llm_distill: build_llm_distill_opts(
                     with_llm_distill,
                     &llm_distill_endpoint,

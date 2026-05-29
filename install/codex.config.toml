@@ -1,0 +1,10 @@
+[mcp_servers.helios-portfolio]
+command = "/home/app/Helios/heliosdb-codekb-mcp/target/release/heliosdb-codekb-mcp"
+args = [
+  "serve",
+  "--source",
+  "/home/app/Helios",
+  "--mega-tool",
+  "--wrapper-cache-size",
+  "128",
+]
