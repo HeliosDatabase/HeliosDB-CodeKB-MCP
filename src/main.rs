@@ -912,7 +912,8 @@ fn build_http_gateway_router(db: Arc<EmbeddedDatabase>, cfg: GatewayCfg) -> axum
 ///   includes a progressToken we still serve it — just synchronously,
 ///   with the rewrite applied to the final response (no per-chunk
 ///   streaming notifications).
-/// * `initialized` notifications are no-ops, same as the engine.
+/// * `initialized` / `notifications/initialized` notifications are no-ops,
+///   same as the engine.
 async fn stdio_loop_with_gateway(
     db: &heliosdb_nano::EmbeddedDatabase,
     cfg: &GatewayCfg,
@@ -953,8 +954,12 @@ async fn stdio_loop_with_gateway(
             }
         };
 
-        // `initialized` is a notification — no response.
-        if req.method == "initialized" {
+        // Initialization notifications are fire-and-forget in MCP. Some
+        // clients use the current namespaced method while older clients used
+        // `initialized`.
+        if req.id.is_none()
+            && (req.method == "initialized" || req.method == "notifications/initialized")
+        {
             continue;
         }
 
