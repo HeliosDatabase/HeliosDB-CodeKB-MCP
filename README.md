@@ -1,18 +1,38 @@
 # heliosdb-codekb-mcp
 
-MCP stdio server for code+docs knowledge bases. Embeds
+Local MCP server for code+docs knowledge bases. Embeds
 [HeliosDB-Nano](https://crates.io/crates/heliosdb-nano) as a Rust
 library (`code-graph`, `graph-rag`, `mcp-endpoint`, `code-embed`
 features) and exposes its LSP-shaped + GraphRAG tools to Claude Code,
-Cursor, Codex, Aider, and any other MCP-aware agent — over plain stdio
-JSON-RPC, no ports, no auth dance, all local.
+Cursor, Codex, Aider, and any other MCP-aware agent. The recommended
+transport is a loopback HTTP daemon (`127.0.0.1`) so local clients share
+one warm embedded KB process instead of starting competing stdio
+processes.
 
-**v0.2.1 headline (qwen3-coder:30b on `/home/gpc/HDB/Full`):
-−37.2 % model tokens vs no-MCP across 15 dev questions** (full report
+**What this buys you:** fewer broad-repo discovery turns, smaller
+tool payloads, reusable code/doc context across Claude Code and Codex,
+and evidence-carrying answers instead of ad hoc `Read`/`Grep` tours.
+It is strongest on monorepos and portfolio-scale work where the agent
+would otherwise repeatedly rediscover the same architecture, docs, and
+file map.
+
+**Published release:** `0.2.5` on crates.io. It adds HTTP-first setup,
+`doctor`, compact `helios(action, args)` routing, exact `file_lookup` /
+`doc_lookup`, and repo-inventory fallback for fast portfolio KBs.
+
+**Benchmark context:** v0.2.1 headline (qwen3-coder:30b on
+`/home/gpc/HDB/Full`): **−37.2 % model tokens vs no-MCP across 15 dev
+questions** (full report
 in [`MCP_ECOSYSTEM_BENCHMARK_REPORT_2026-05-27.md`](./MCP_ECOSYSTEM_BENCHMARK_REPORT_2026-05-27.md)).
 Biggest single-question wins: **−76 k, −69 k, −47 k tokens** on
 broad-architecture queries. See [Honest caveats](#honest-caveats) for
 the workloads where Read+Grep is still cheaper.
+
+On the newer `/home/app/Helios` portfolio re-test for v0.2.4/v0.2.5, the best
+full run observed **−28.7 % model tokens** with a warm loopback HTTP MCP
+daemon. A later routing run measured **−19.4 %**. That is still a real
+improvement, but not a universal win; exact narrow lookups can still be
+cheaper with raw local search.
 
 ## Why it improves answer quality, not just token count
 
@@ -25,6 +45,7 @@ also reduces tokens; both directions point the same way.
 |---|---|
 | **Pre-distilled answer cards** (`helios.answer_card.v1`) | Every wrapper response carries a `summary` + `evidence` array (file:line citations, qualified symbol names, doc-section IDs) + `omitted` metadata. The model doesn't have to remember where it found something across N turns — the citation rides with the answer. Less hallucinated provenance, fewer "I think this was in some file…" lapses. |
 | **`helios_ask` question router** | One entry point that inspects the question and picks the right sub-wrapper (repo summary / outline-first / symbol card / doc drill). Stops the model from going down the wrong path (e.g. grep when it should outline-first). On the Full bench this picked correctly on most questions; the report calls out where it didn't and what would fix it. |
+| **Exact file/doc lookup wrappers** | `helios_file_lookup` and `helios_doc_lookup` answer "show README.md", "where is Cargo.toml", and direct filename questions from the KB's compact ingest tables before falling back to GraphRAG. This removes a major regression path from earlier benches: exact file questions no longer need broad graph traversal. |
 | **LLM-distilled symbol summaries** (Phase 2 ingest) | Each public symbol gets a one-sentence purpose summary generated ONCE at ingest by a code-aware model (e.g. `qwen3-coder:30b`), stored in `_hdb_plugin_symbol_cards.llm_summary`, reused across every agent query. A Haiku 4.5 query against a qwen-distilled card often produces a more accurate answer than Haiku reading the raw body and re-deriving the purpose itself. |
 | **Cross-modal `MENTIONS` edges** | When the agent searches "FastEmbedder", the response includes the symbol AND the doc passages that name it. The agent verifies the doc claim against the actual code in one round-trip instead of having to grep both surfaces independently and stitch results. |
 | **PageRank-ranked file index** | `helios_repo_summary` orders files by the symbol-graph PageRank, so the agent investigates the load-bearing implementation files before tests or examples. Without this, "describe the architecture" agents reliably waste 5–10 turns walking peripheral code. |
@@ -41,12 +62,14 @@ also reduces tokens; both directions point the same way.
 | **"What did this look like before"** (time-travel / branch / commit diff) | `helios_ast_diff`, `heliosdb_branch_*`, `heliosdb_time_travel` answer "what did this symbol look like at commit X / on branch Y" with typed AST deltas. Read+Grep would need a checkout + reindex + grep cycle. |
 | **Catastrophe prevention on multi-turn tours** | On the canonical Haiku bench, Opus hit its budget cap on 5/10 questions WITHOUT MCP (no answer); Haiku burned 22-32 grep+read turns on the same questions. WITH MCP, the same questions land in 3-6 turns. This stabilises the *tail*, not always the median. |
 | **Doc-heavy workflows** | Heading-chunked `.md` ingest means `helios_graphrag_search` returns the matching `DocSection` instead of the full file. Doc retrieval shrinks to one section per question. |
+| **Exact path questions** | `helios_file_lookup` / `helios_doc_lookup` return bounded KB snippets and evidence for known paths, avoiding both full-file `Read` payloads and broad graph searches. |
 
 ## Honest caveats
 
-- **Direct file/symbol lookups where the agent knows the path can still be cheaper through raw Read+Grep.** The Full bench: MCP won 8/15 questions, lost 7/15. Wins were broad; losses were targeted lookups (e.g. "show me the public types in crate X" — one Read of the lib.rs beats a wrapper round-trip).
+- **Direct symbol lookups can still be cheaper through raw Read+Grep when the agent already knows the exact file and only needs a tiny span.** The v0.2.4 `file_lookup` / `doc_lookup` wrappers remove the worst exact-path regression, but symbol-card coverage still matters for "public types in crate X" style questions.
 - **Symbol-card population is content-hash-gated.** If `helios_symbol_card` returns `{"status": "not_found"}`, re-run `ingest` to backfill the cards. The Full benchmark report has a "Recommended Next Work" section calling out the cases where card coverage matters most.
 - **Cold-start cost is high on benchmarks** because each WITH-MCP run launches a fresh `serve` subprocess. Real agent sessions keep the server warm; the per-question cold start ratio improves with longer sessions.
+- **Full portfolio code-graph indexing still has an engine bottleneck.** Nano 3.36.1's cross-file resolver can become a long serial phase on very large KBs. Fast ingest mode remains useful for file/doc lookup and GraphRAG, but deep symbol cards need the engine-side resolver work to become adoption-grade on the largest portfolios.
 - **Engine-side FRs are queued.** Four engine improvements would unlock another step-change in both quality and cost — tracked in [`ENGINE_FRS_FROM_CODEKB_2026-05-26.md`](./ENGINE_FRS_FROM_CODEKB_2026-05-26.md). FR #1 (FK validation throughput) is the prerequisite for benching on `/home/gpc/HDB`-scale (10 k+ files) corpora; FR #4 (`tools/list verbose=false`) would compose with the existing `--mega-tool` for even smaller catalogue payloads.
 
 Use the plugin when the cross-modal / time-travel / catastrophe-prevention / answer-grounding value matters. The aggregate token win on broad workloads (−37 % on Full) is a bonus; the per-answer quality lift is the durable value.
@@ -61,8 +84,9 @@ cargo install heliosdb-codekb-mcp
 ```
 
 This is the recommended path for every platform (Linux x86_64,
-Linux aarch64, macOS Intel, macOS Apple Silicon). Latest published
-version: **[v0.2.3](https://crates.io/crates/heliosdb-codekb-mcp)**.
+Linux aarch64, macOS Intel, macOS Apple Silicon). Current source
+version and crates.io release:
+**[0.2.5](https://crates.io/crates/heliosdb-codekb-mcp)**.
 First build pulls the engine (`heliosdb-nano`) and is slow (~10 min);
 subsequent updates are cached.
 
@@ -70,8 +94,10 @@ subsequent updates are cached.
 <summary>Alternative: pre-built Linux x86_64 binary</summary>
 
 A stripped Linux x86_64 binary is attached to the GitHub release for
-each tagged version. Use this if your machine doesn't have a Rust
-toolchain handy.
+tagged versions that publish binary artifacts. Use this if your machine
+doesn't have a Rust toolchain handy. The links below currently point at
+the latest binary artifact set (`v0.2.3`); use `cargo install
+heliosdb-codekb-mcp` for the crates.io `0.2.5` release.
 
 ```bash
 curl -L \
@@ -83,8 +109,10 @@ curl -sL https://github.com/HeliosDatabase/HeliosDB-CodeKB-MCP/releases/download
   | sha256sum -c -
 ```
 
-macOS / aarch64 binaries are not yet pre-built; use
-`cargo install heliosdb-codekb-mcp` on those platforms.
+macOS x86_64 binaries are also attached to tagged releases. Linux
+aarch64 / macOS Apple Silicon users should use
+`cargo install heliosdb-codekb-mcp` until native release artifacts are
+published.
 
 </details>
 
@@ -120,33 +148,37 @@ This repository also ships ready-to-merge templates under
 [`install/`](./install/) for the `/home/app/Helios` portfolio KB:
 `install/claude-code.mcp.json` and `install/codex.config.toml`.
 
+#### Start the local MCP daemon
+
+Run one server per KB and keep it running for all local agents:
+
+```bash
+heliosdb-codekb-mcp serve --source /abs/path/to/your/project \
+  --http 127.0.0.1:8765 --wrapper-cache-size 128
+```
+
+The HTTP transport refuses non-loopback binds by default. To expose it
+outside the machine, set `HELIOS_ALLOW_NON_LOOPBACK_HTTP=1`
+intentionally and only on a trusted network.
+
 #### Claude Code (`claude-code`)
 
-**Per-project `.mcp.json`** (recommended — server scope follows the
-project automatically):
-
-Drop this at `<project>/.mcp.json`:
+**Per-project `.mcp.json`**:
 
 ```json
 {
   "mcpServers": {
     "helios": {
-      "command": "heliosdb-codekb-mcp",
-      "args": [
-        "serve",
-        "--source", "${CLAUDE_PROJECT_DIR}",
-        "--wrapper-cache-size", "128"
-      ]
+      "type": "http",
+      "url": "http://127.0.0.1:8765/"
     }
   }
 }
 ```
 
-`${CLAUDE_PROJECT_DIR}` is expanded by Claude Code to the project
-root, so the same `.mcp.json` works across machines. `--mega-tool` is
-the default since v0.2.0 — fresh installs get the compact one-tool
-surface automatically. Add `--no-mega-tool` if you want the full
-multi-tool catalogue.
+`--mega-tool` is the default since v0.2.0, so the daemon advertises the
+compact one-tool surface automatically unless you explicitly configure
+profile mode.
 
 **As a Claude Code plugin** (gets you the `/codekb-setup`,
 `/codekb-ingest`, `/codekb-status` slash commands + the
@@ -167,32 +199,27 @@ Add the server to `~/.codex/config.toml`:
 
 ```toml
 [mcp_servers.helios]
-command = "heliosdb-codekb-mcp"
-args = [
-  "serve",
-  "--source", "/abs/path/to/your/project",
-  "--wrapper-cache-size", "128",
-]
+url = "http://127.0.0.1:8765/"
 ```
 
-CODEX doesn't expand a `${CLAUDE_PROJECT_DIR}`-style variable, so use
-an absolute project path. To switch projects, edit the path (or run
-several named servers — `helios-foo`, `helios-bar`, …). Verify the
-server is registered with:
+To switch projects, run a different loopback port and add another named
+server (`helios-foo`, `helios-bar`, …). Verify the server is registered
+with:
 
 ```bash
 codex --print mcp_servers
 ```
 
-Then start a session as usual; the `helios(action, args)` tool
-should appear in the tool list. If CODEX reports "MCP server not
-found", confirm `heliosdb-codekb-mcp` is on the `PATH` the
-`codex` process sees (`which heliosdb-codekb-mcp` from your shell;
-if `cargo install`-ed, `~/.cargo/bin` must be on `PATH`).
+Then start a session as usual; the `helios(action, args)` tool should
+appear in the tool list. If CODEX reports the server is unreachable,
+run:
 
-#### Cursor / Continue / other MCP clients (HTTP transport)
+```bash
+heliosdb-codekb-mcp doctor --source /abs/path/to/your/project \
+  --mcp-url http://127.0.0.1:8765
+```
 
-For clients that don't speak stdio:
+#### Cursor / Continue / other MCP clients
 
 ```bash
 heliosdb-codekb-mcp serve --source /abs/path \
@@ -233,12 +260,13 @@ Three things at once:
 2. **A KB resolver.** Given a source path, finds the right KB
    directory using the persisted config (with longest-prefix match
    for hybrid setups that span multiple sub-trees).
-3. **The MCP stdio server.** `serve --source <PATH>` opens an
-   `EmbeddedDatabase` rooted at that source's KB and runs
-   `heliosdb_nano::mcp::McpServer::new(db).run().await`.  All
-   query tools (`helios_lsp_*`, `helios_graphrag_search`,
-   `helios_ast_diff`, …) come from the engine library — this
-   binary owns transport and config, not tool surface.
+3. **The local MCP server.** `serve --source <PATH>` opens an
+   `EmbeddedDatabase` rooted at that source's KB. Prefer
+   `--http 127.0.0.1:<port>` for Claude Code/Codex multi-session use;
+   stdio remains available as a fallback. Most query tools
+   (`helios_lsp_*`, `helios_graphrag_search`, `helios_ast_diff`, …)
+   come from the engine library, while this binary owns config,
+   transport, compact wrappers, and answer-card shaping.
 
 ## KB-location modes
 

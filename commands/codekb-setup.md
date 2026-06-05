@@ -12,16 +12,22 @@ Check if `heliosdb-codekb-mcp` is on the user's PATH:
 command -v heliosdb-codekb-mcp || echo "NOT_INSTALLED"
 ```
 
-If the binary is missing **and** the user is on Linux x86_64 (`uname -ms` shows `Linux x86_64`), offer to download v0.1.0 to `~/.local/bin` and `chmod +x` it:
+If the binary is missing, offer the current crates.io install path first:
+
+```bash
+cargo install heliosdb-codekb-mcp
+```
+
+If the user has no Rust toolchain and is on Linux x86_64 (`uname -ms` shows `Linux x86_64`), offer the latest published binary artifact set to `~/.local/bin` and `chmod +x` it:
 
 ```bash
 mkdir -p ~/.local/bin
-curl -L https://github.com/HeliosDatabase/HeliosDB-CodeKB-MCP/releases/download/v0.1.0/heliosdb-codekb-mcp-linux-x86_64 \
+curl -L https://github.com/HeliosDatabase/HeliosDB-CodeKB-MCP/releases/download/v0.2.3/heliosdb-codekb-mcp-linux-x86_64 \
   -o ~/.local/bin/heliosdb-codekb-mcp
 chmod +x ~/.local/bin/heliosdb-codekb-mcp
 ```
 
-For macOS / aarch64 / other platforms: tell the user pre-built binaries are not yet published and offer to `cargo install --git https://github.com/HeliosDatabase/HeliosDB-CodeKB-MCP --features native-binary-docs` instead. Confirm before running.
+If the user wants this checkout instead of crates.io, offer to run `cargo install --path /abs/path/to/heliosdb-codekb-mcp --features native-binary-docs`. For macOS / aarch64 / other platforms without Rust, explain that native release artifacts are not yet published and source/crates install is required. Confirm before running.
 
 ## 2. Ask about compact MCP mode
 
@@ -84,50 +90,58 @@ heliosdb-codekb-mcp ingest --source "${CLAUDE_PROJECT_DIR}"
 Write the serve defaults to the user-level config TOML so future `serve` invocations pick them up without `.mcp.json` edits.
 
 ```bash
-# Use the binary's config helper to find the path, then merge the
-# [serve] section in place (toml-aware merge via a tiny Python one-liner
-# to preserve other keys).
-CONFIG_PATH=$(heliosdb-codekb-mcp config path)
-python3 - "$CONFIG_PATH" "$PROFILE" "$MEGA_TOOL" <<'PY'
-import sys, tomllib, pathlib
-p, profile, mega_tool = pathlib.Path(sys.argv[1]), sys.argv[2], sys.argv[3].lower() == "true"
-data = tomllib.loads(p.read_text()) if p.exists() else {}
-serve = data.setdefault("serve", {})
-serve["profile"] = profile
-serve["mega_tool"] = mega_tool
-serve["wrapper_cache_size"] = 128 if mega_tool else 0
-# tomllib has no dump; write back a minimal TOML manually.
-out = []
-for k, v in data.items():
-    if isinstance(v, dict):
-        out.append(f"[{k}]")
-        for sk, sv in v.items():
-            if isinstance(sv, str):
-                out.append(f'{sk} = "{sv}"')
-            elif isinstance(sv, bool):
-                out.append(f"{sk} = {'true' if sv else 'false'}")
-            else:
-                out.append(f"{sk} = {sv}")
-        out.append("")
-    else:
-        out.insert(0, f'{k} = "{v}"' if isinstance(v, str) else f"{k} = {v}")
-p.write_text("\n".join(out).rstrip() + "\n")
-PY
-echo "wrote [serve] profile = \"$PROFILE\", mega_tool = $MEGA_TOOL to $CONFIG_PATH"
+if [ "$MEGA_TOOL" = "true" ]; then
+  heliosdb-codekb-mcp config set-serve \
+    --profile "$PROFILE" \
+    --mega-tool \
+    --wrapper-cache-size 128 \
+    --strip-tool-descriptions 200
+else
+  heliosdb-codekb-mcp config set-serve \
+    --profile "$PROFILE" \
+    --no-mega-tool \
+    --wrapper-cache-size 0 \
+    --strip-tool-descriptions 200
+fi
 ```
 
-## 8. Confirm and hand off
+## 8. Start or register the HTTP MCP daemon
+
+HTTP is preferred over stdio for embedded KBs because Claude Code, Codex, and other local agents can share one warm process and avoid multi-process KB lock conflicts.
+
+Tell the user to keep this running in a terminal, tmux session, or local service:
+
+```bash
+heliosdb-codekb-mcp serve --source "${CLAUDE_PROJECT_DIR}" \
+  --http 127.0.0.1:8765 --wrapper-cache-size 128
+```
+
+The project `.mcp.json` should point to that local server:
+
+```json
+{
+  "mcpServers": {
+    "helios": {
+      "type": "http",
+      "url": "http://127.0.0.1:8765/"
+    }
+  }
+}
+```
+
+## 9. Confirm and hand off
 
 After ingest exits, run:
 
 ```bash
-heliosdb-codekb-mcp status --source "${CLAUDE_PROJECT_DIR}"
+heliosdb-codekb-mcp doctor --source "${CLAUDE_PROJECT_DIR}" \
+  --mcp-url http://127.0.0.1:8765
 ```
 
 Tell the user:
 - The KB is ready and the compact `helios` MCP tool should appear in their next message's tool list.
 - If they ran `--background-quality`, paraphrase queries will improve once the child finishes (typically a few minutes); `/codekb-status` shows progress.
-- Suggest a starter query like `helios(action="ask", args={"question":"Where is authentication handled?"})`, adapted to the user's project, to confirm it's working.
+- Suggest a starter query like `helios(action="ask", args={"question":"Where is authentication handled?"})`, adapted to the user's project, to confirm it's working. For exact path checks, use `helios(action="file_lookup", args={"path":"README.md"})`.
 
 ## Honest caveat
 

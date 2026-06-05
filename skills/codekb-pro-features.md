@@ -33,13 +33,13 @@ The plugin's post-ingest linker emits `MENTIONS` edges from doc text nodes to `_
 
 ## Transport modes
 
-Default plugin install uses stdio (one server per Claude Code session). For multi-client workflows (e.g. Cursor in another window querying the same KB), the user can run:
+Default plugin install should use a loopback HTTP daemon (one server per KB). That lets Claude Code, Codex, Cursor, and other local clients share a warm embedded process and avoids multiple stdio sessions trying to open the same KB lock. Run:
 
 ```bash
-heliosdb-codekb-mcp serve --source <path> --http 127.0.0.1:8765
+heliosdb-codekb-mcp serve --source <path> --http 127.0.0.1:8765 --wrapper-cache-size 128
 ```
 
-and any MCP-aware client can hit `POST /`, `GET /ws`, `GET /sse`, or `GET /info` (cache stats). The plugin's `/codekb-status --mcp-url …` reads `/info`.
+and any MCP-aware client can hit `POST /`, `GET /ws`, `GET /sse`, or `GET /info` (cache stats). The plugin's `/codekb-status --mcp-url …` reads `/info`; `heliosdb-codekb-mcp doctor --source <path> --mcp-url …` diagnoses config, HTTP reachability, and KB lock holders.
 
 ## Tuning knobs worth knowing
 
@@ -48,24 +48,26 @@ and any MCP-aware client can hit `POST /`, `GET /ws`, `GET /sse`, or `GET /info`
 
 ## Compression-mode tool mapping (Phase 1)
 
-The plugin ships six **wrapper tools** that compose engine library calls into one distilled response. They are smaller-by-design than the equivalent engine-primitive sequence. The agent should prefer them when one applies:
+The plugin ships compact **wrapper tools** that compose engine library calls into one distilled response. They are smaller-by-design than the equivalent engine-primitive sequence. The agent should prefer them when one applies:
 
 | Question shape | Prefer this wrapper | Instead of |
 |---|---|---|
 | General repository question | `helios(action="ask", args={"question":"..."})` or `helios_ask(question="...")` | model-selected Read/Grep loops |
 | "Describe the architecture" / "what's the layout of this codebase" | `helios_repo_summary(detail="file_index")` | walking `Read` over many files |
+| Exact file/path question ("show README.md", "where is Cargo.toml") | `helios(action="file_lookup", args={"path":"README.md"})` or `helios_file_lookup(path="...")` | broad GraphRAG search or full-file Read |
+| Exact doc question / doc filename | `helios(action="doc_lookup", args={"path":"docs/foo.md"})` or `helios_doc_lookup(query="...")` | `helios_graphrag_search` returning large subgraphs |
 | Doc question ("where do the docs cover X") | `helios_outline_first(query="X")` → if needed, `helios_doc_drill(section_id)` | `helios_graphrag_search` returning whole DocChunks |
 | "Where is `X` defined / who calls it" | `helios_symbol_card(qualified_name="X")` | `Read` + `Grep` loop or `helios_lsp_definition` + `helios_lsp_references` separately |
 | Diff / refactor audit ("what changed between A and B") | `helios_git_summary(commit_a, commit_b)` | `Bash(git diff)` |
 
 `helios_semantic_filter` is intentionally hidden unless the binary is built with `--features wrappers-semantic`; the engine filtered-KNN dependency is not in the default release yet.
 
-Each wrapper is gated by the active `--profile`. The default `standard` profile advertises all six plus a curated read-only engine subset; `minimal` drops the engine LSP/branch tools entirely; `full` is pass-through.
+Each wrapper is gated by the active `--profile`. The default compact mode advertises one `helios(action,args)` gateway; explicit `standard` profile advertises wrappers plus a curated read-only engine subset; `minimal` drops the engine LSP/branch tools entirely; `full` is pass-through.
 
 **Falling back:** if a wrapper returns `{"status": "not_found"}` or `{"status": "cards_not_built"}`, drop down to the engine-primitive tools (`helios_lsp_*`, `helios_graphrag_search`). The wrappers degrade gracefully — they never block a question.
 
 ## What this plugin is NOT
 
 - **Not a code formatter / linter.** No `helios_format` / `helios_lint`. Use language-native tools.
-- **Not auto-re-indexing.** The plugin only re-ingests when the user runs `/codekb-ingest`. Suggest this after meaningful changes — but warn before doing it on a repo with the engine FK regression unfixed.
-- **Not real-time collaborative.** One writer per KB (engine constraint). Multiple readers are fine via HTTP transport.
+- **Not auto-re-indexing.** The plugin only re-ingests when the user runs `/codekb-ingest`. Suggest this after meaningful changes.
+- **Not a shared network service by default.** HTTP binds are loopback-only unless the operator explicitly sets `HELIOS_ALLOW_NON_LOOPBACK_HTTP=1`.

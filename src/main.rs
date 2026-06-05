@@ -1,4 +1,4 @@
-//! `heliosdb-codekb-mcp` — MCP stdio server backed by an embedded
+//! `heliosdb-codekb-mcp` — local MCP server backed by an embedded
 //! HeliosDB-Nano knowledge base.
 //!
 //! This binary is the consumer of the engine's `mcp-endpoint` /
@@ -9,8 +9,9 @@
 //! tree, or a hybrid multi-source aggregate.
 //!
 //! Subcommands:
-//!   serve      run the stdio MCP loop bound to the source's KB
+//!   serve      run an MCP server bound to the source's KB
 //!   init       create / configure a KB for a source path
+//!   doctor     diagnose config, HTTP, and embedded-KB lock state
 //!   status     show config and per-KB stats
 //!   config     get/set values in the user-level config TOML
 //!
@@ -24,7 +25,7 @@
 use std::path::PathBuf;
 use std::sync::Arc;
 
-use anyhow::{Context, Result};
+use anyhow::{bail, Context, Result};
 use clap::{Parser, Subcommand};
 use heliosdb_nano::EmbeddedDatabase;
 
@@ -46,7 +47,7 @@ use quality::{Phase, QualityProgress};
 #[derive(Parser)]
 #[command(
     name = "heliosdb-codekb-mcp",
-    about = "MCP stdio server backed by an embedded HeliosDB-Nano KB."
+    about = "Local MCP server backed by an embedded HeliosDB-Nano CodeKB."
 )]
 struct Cli {
     #[command(subcommand)]
@@ -56,10 +57,9 @@ struct Cli {
 #[derive(Subcommand)]
 enum Commands {
     /// Run the MCP server for the KB associated with `--source`.
-    /// Default transport is stdio (the `.mcp.json` Claude Code path);
-    /// pass `--http <addr>` to bind an HTTP/WebSocket/SSE endpoint
-    /// instead — useful for Cursor and other clients that don't
-    /// speak stdio.
+    /// Prefer `--http 127.0.0.1:<port>` for Claude Code/Codex
+    /// multi-session use. Without `--http`, runs stdio as a fallback
+    /// for clients that spawn one server process per session.
     Serve {
         /// Absolute path of the source root the agent is working in.
         /// Used to look up the KB in the user-level config.
@@ -336,6 +336,17 @@ enum Commands {
         mcp_url: Option<String>,
     },
 
+    /// Diagnose install, config, HTTP reachability, and embedded-KB locks.
+    Doctor {
+        /// Source root to diagnose. When omitted, prints global config only.
+        #[arg(long)]
+        source: Option<PathBuf>,
+
+        /// Running HTTP MCP endpoint to probe, e.g. http://127.0.0.1:8765.
+        #[arg(long, value_name = "URL")]
+        mcp_url: Option<String>,
+    },
+
     /// Read or update a value in the config TOML.
     Config {
         #[command(subcommand)]
@@ -354,6 +365,19 @@ enum ConfigAction {
     },
     /// Print the path of the config file (creates it if missing).
     Path,
+    /// Set serve defaults persisted in the user-level config TOML.
+    SetServe {
+        #[arg(long, value_parser = ["minimal", "standard", "full"])]
+        profile: Option<String>,
+        #[arg(long, value_name = "MODE")]
+        strip_tool_descriptions: Option<String>,
+        #[arg(long, default_value_t = false, conflicts_with = "no_mega_tool")]
+        mega_tool: bool,
+        #[arg(long, default_value_t = false)]
+        no_mega_tool: bool,
+        #[arg(long)]
+        wrapper_cache_size: Option<usize>,
+    },
 }
 
 #[tokio::main]
@@ -482,6 +506,7 @@ async fn main() -> Result<()> {
             run_and_print_ingest(&opts)
         }
         Commands::Status { source, mcp_url } => status(source.as_deref(), mcp_url.as_deref()),
+        Commands::Doctor { source, mcp_url } => doctor(source.as_deref(), mcp_url.as_deref()),
         Commands::Config { action } => match action {
             ConfigAction::Show => {
                 let cfg = Config::load_or_default()?;
@@ -498,6 +523,32 @@ async fn main() -> Result<()> {
             }
             ConfigAction::Path => {
                 println!("{}", Config::path()?.display());
+                Ok(())
+            }
+            ConfigAction::SetServe {
+                profile,
+                strip_tool_descriptions,
+                mega_tool,
+                no_mega_tool,
+                wrapper_cache_size,
+            } => {
+                let mut cfg = Config::load_or_default()?;
+                if let Some(ref p) = profile {
+                    mcp_trim::Profile::parse(p).map_err(|e| anyhow::anyhow!(e))?;
+                    cfg.serve.profile = Some(p.clone());
+                }
+                if let Some(ref s) = strip_tool_descriptions {
+                    mcp_trim::StripDescMode::parse(s).map_err(|e| anyhow::anyhow!(e))?;
+                    cfg.serve.strip_tool_descriptions = Some(s.clone());
+                }
+                if let Some(v) = cli_mega_choice(mega_tool, no_mega_tool) {
+                    cfg.serve.mega_tool = Some(v);
+                }
+                if let Some(v) = wrapper_cache_size {
+                    cfg.serve.wrapper_cache_size = Some(v);
+                }
+                cfg.save()?;
+                eprintln!("serve defaults saved at {}", Config::path()?.display());
                 Ok(())
             }
         },
@@ -615,6 +666,7 @@ async fn serve(
             }
         }
         Some(addr) => {
+            ensure_loopback_http_bind(addr)?;
             let listener = tokio::net::TcpListener::bind(addr)
                 .await
                 .with_context(|| format!("bind MCP HTTP listener on {addr}"))?;
@@ -643,6 +695,33 @@ async fn serve(
                 .map_err(|e| anyhow::anyhow!("MCP HTTP server failed: {e}"))
         }
     }
+}
+
+fn ensure_loopback_http_bind(addr: &str) -> Result<()> {
+    if is_loopback_http_bind(addr) {
+        return Ok(());
+    }
+    if std::env::var("HELIOS_ALLOW_NON_LOOPBACK_HTTP").as_deref() == Ok("1") {
+        tracing::warn!(
+            %addr,
+            "serving MCP HTTP on a non-loopback address because HELIOS_ALLOW_NON_LOOPBACK_HTTP=1"
+        );
+        return Ok(());
+    }
+    bail!(
+        "refusing to bind MCP HTTP on non-loopback address `{addr}`. \
+         Use 127.0.0.1:<port> for local agent clients, or set \
+         HELIOS_ALLOW_NON_LOOPBACK_HTTP=1 only on a trusted network."
+    );
+}
+
+fn is_loopback_http_bind(addr: &str) -> bool {
+    if addr.starts_with("localhost:") {
+        return true;
+    }
+    addr.parse::<std::net::SocketAddr>()
+        .map(|a| a.ip().is_loopback())
+        .unwrap_or(false)
 }
 
 fn resolve_mega_tool(cli_mega_tool: Option<bool>, cli_profile: Option<&str>, cfg: &Config) -> bool {
@@ -1052,6 +1131,163 @@ fn init(
     eprintln!();
     eprintln!("Next: register the MCP server with your agent and start a session.");
     Ok(())
+}
+
+fn doctor(source: Option<&std::path::Path>, mcp_url: Option<&str>) -> Result<()> {
+    let cfg_path = Config::path()?;
+    let cfg = Config::load_or_default()?;
+
+    println!("binary : heliosdb-codekb-mcp {}", env!("CARGO_PKG_VERSION"));
+    println!("config : {}", cfg_path.display());
+    println!("default-mode : {}", cfg.default_mode.as_str());
+    println!(
+        "serve defaults : profile={} mega_tool={} wrapper_cache_size={}",
+        cfg.serve.profile.as_deref().unwrap_or("(default standard)"),
+        cfg.serve
+            .mega_tool
+            .map(|v| v.to_string())
+            .unwrap_or_else(|| "(default compact)".to_string()),
+        cfg.serve
+            .wrapper_cache_size
+            .map(|v| v.to_string())
+            .unwrap_or_else(|| "(default 128 in compact mode)".to_string())
+    );
+
+    if let Some(s) = source {
+        let canonical = s.canonicalize().with_context(|| {
+            format!(
+                "source path `{}` must exist and be canonicalisable",
+                s.display()
+            )
+        })?;
+        println!("source : {}", canonical.display());
+        match cfg.lookup_for_source(&canonical) {
+            Some(spec) => {
+                println!("kb     : {}", spec.kb_dir.display());
+                println!("mode   : {}", spec.mode.as_str());
+                let lock_path = spec.kb_dir.join("LOCK");
+                if lock_path.exists() {
+                    let holders = find_lock_holders(&lock_path);
+                    if holders.is_empty() {
+                        println!(
+                            "lock   : {} exists, no local process currently has it open",
+                            lock_path.display()
+                        );
+                    } else {
+                        println!("lock   : {} held/open by:", lock_path.display());
+                        for pid in holders {
+                            let cmd = proc_cmdline(pid).unwrap_or_else(|| "(unknown)".to_string());
+                            println!("         pid {pid}: {cmd}");
+                        }
+                    }
+                } else {
+                    println!("lock   : no LOCK file at {}", lock_path.display());
+                }
+                print_resume_state(&spec.kb_dir);
+                print_quality_phase(&spec.kb_dir);
+            }
+            None => println!("kb     : no KB configured for {}", canonical.display()),
+        }
+    }
+
+    if let Some(url) = mcp_url {
+        print_mcp_http_info(url);
+    }
+
+    Ok(())
+}
+
+fn print_mcp_http_info(url: &str) {
+    let info_url = if url.trim_end_matches('/').ends_with("/info") {
+        url.to_string()
+    } else {
+        format!("{}/info", url.trim_end_matches('/'))
+    };
+    let resp = match ureq::get(&info_url)
+        .timeout(std::time::Duration::from_millis(1000))
+        .call()
+    {
+        Ok(r) => r,
+        Err(e) => {
+            println!("http   : could not reach {info_url}: {e}");
+            return;
+        }
+    };
+    let info: serde_json::Value = match resp.into_json() {
+        Ok(v) => v,
+        Err(e) => {
+            println!("http   : response from {info_url} was not JSON: {e}");
+            return;
+        }
+    };
+    let name = info["serverInfo"]["name"].as_str().unwrap_or("(unknown)");
+    let protocol = info["protocolVersion"].as_str().unwrap_or("(unknown)");
+    let tool_count = info["tool_count"]
+        .as_u64()
+        .or_else(|| info["tools"].as_array().map(|a| a.len() as u64))
+        .unwrap_or(0);
+    println!("http   : reachable at {info_url}");
+    println!("         server={name} protocol={protocol} tools={tool_count}");
+    if let Some(cache) = info.get("cache") {
+        let size = cache.get("size").and_then(|v| v.as_u64()).unwrap_or(0);
+        let cap = cache.get("capacity").and_then(|v| v.as_u64()).unwrap_or(0);
+        let hits = cache.get("hits").and_then(|v| v.as_u64()).unwrap_or(0);
+        let misses = cache.get("misses").and_then(|v| v.as_u64()).unwrap_or(0);
+        println!("         cache={size}/{cap} hits={hits} misses={misses}");
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn find_lock_holders(lock_path: &std::path::Path) -> Vec<u32> {
+    let target = lock_path
+        .canonicalize()
+        .unwrap_or_else(|_| lock_path.to_path_buf());
+    let mut out = Vec::new();
+    let Ok(proc_entries) = std::fs::read_dir("/proc") else {
+        return out;
+    };
+    for entry in proc_entries.flatten() {
+        let Some(pid) = entry
+            .file_name()
+            .to_str()
+            .and_then(|s| s.parse::<u32>().ok())
+        else {
+            continue;
+        };
+        let fd_dir = entry.path().join("fd");
+        let Ok(fds) = std::fs::read_dir(fd_dir) else {
+            continue;
+        };
+        for fd in fds.flatten() {
+            if let Ok(link) = std::fs::read_link(fd.path()) {
+                if link == target {
+                    out.push(pid);
+                    break;
+                }
+            }
+        }
+    }
+    out.sort_unstable();
+    out.dedup();
+    out
+}
+
+#[cfg(not(target_os = "linux"))]
+fn find_lock_holders(_lock_path: &std::path::Path) -> Vec<u32> {
+    Vec::new()
+}
+
+fn proc_cmdline(pid: u32) -> Option<String> {
+    let bytes = std::fs::read(format!("/proc/{pid}/cmdline")).ok()?;
+    if bytes.is_empty() {
+        return None;
+    }
+    let mut s = String::from_utf8_lossy(&bytes).replace('\0', " ");
+    if s.len() > 180 {
+        s.truncate(180);
+        s.push_str("...");
+    }
+    Some(s.trim().to_string())
 }
 
 fn status(source: Option<&std::path::Path>, mcp_url: Option<&str>) -> Result<()> {

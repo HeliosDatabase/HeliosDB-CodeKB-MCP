@@ -2102,7 +2102,7 @@ checksum = "2304e00983f87ffb38b55b444b5e3b60a884b5d30c0fca7d82fe33449bbe55ea"
 
 [[package]]
 name = "heliosdb-codekb-mcp"
-version = "0.2.3"
+version = "0.2.5"
 dependencies = [
  "anyhow",
  "axum",
@@ -2128,9 +2128,9 @@ dependencies = [
 
 [[package]]
 name = "heliosdb-nano"
-version = "3.33.0"
+version = "3.36.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "d2c02a697784909caa597a3b7a51d9a3962f9da30769ec1511c7f2a685d7e821"
+checksum = "da07578193ef65a5e3f1ba0d7461a099b2efc5e66545a1eadcf669342b870797"
 dependencies = [
  "aes-gcm",
  "argon2",

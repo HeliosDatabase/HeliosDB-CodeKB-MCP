@@ -1,13 +1,8 @@
 {
   "mcpServers": {
     "helios": {
-      "command": "heliosdb-codekb-mcp",
-      "args": [
-        "serve",
-        "--source", "${CLAUDE_PROJECT_DIR}",
-        "--mega-tool",
-        "--wrapper-cache-size", "128"
-      ]
+      "type": "http",
+      "url": "http://127.0.0.1:8765/"
     }
   }
 }

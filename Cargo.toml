@@ -1,10 +1,14 @@
 [package]
 name = "heliosdb-codekb-mcp"
-version = "0.2.3"
+version = "0.2.5"
 edition = "2021"
-description = "MCP stdio server for code+docs knowledge bases, embedding HeliosDB-Nano as a library."
+description = "Local MCP server for code+docs knowledge bases, embedding HeliosDB-Nano as a library."
 license = "Apache-2.0"
 repository = "https://github.com/HeliosDatabase/HeliosDB-CodeKB-MCP"
+exclude = [
+    "bench/__pycache__/**",
+    "docs/**",
+]
 
 # Standalone — explicit empty workspace so Cargo doesn't try to attach
 # this crate to any parent workspace (helps when sitting next to a

@@ -219,9 +219,9 @@ BENCH_DIR=/tmp/mybench WITH_DIR=/tmp/mybench/full-with WITHOUT_DIR=/tmp/mybench/
 heliosdb-codekb-mcp init --source $WITH_DIR --mode global --ingest
 
 # 4. Run the bench (no `claude -p`, no API spend).
-OLLAMA_BASE=http://ollama:11434 \
-OLLAMA_MODEL=qwen3-coder:30b \
-WITH_DIR=$WITH_DIR \
+    OLLAMA_BASE=http://ollama:11434 \
+    OLLAMA_MODEL=qwen3-coder:30b \
+    WITH_DIR=$WITH_DIR \
 WITHOUT_DIR=$WITHOUT_DIR \
 BENCH_DIR=$BENCH_DIR/results \
 python3 bench/ollama_run.py
@@ -229,6 +229,36 @@ python3 bench/ollama_run.py
 # 5. Aggregate.
 python3 bench/ollama_compare.py $BENCH_DIR/results > $BENCH_DIR/SUMMARY-phase1.md
 ```
+
+### Warm HTTP daemon mode
+
+For adoption and release-gate benches, prefer HTTP mode so the MCP server
+stays warm across questions:
+
+```bash
+heliosdb-codekb-mcp serve --source /home/app/Helios \
+  --http 127.0.0.1:8765 --wrapper-cache-size 128
+
+OLLAMA_BASE=http://ollama:11434 \
+OLLAMA_MODEL=qwen3-coder:30b \
+WITH_DIR=/home/app/Helios \
+WITHOUT_DIR=/home/app/Helios \
+MCP_URL=http://127.0.0.1:8765/ \
+QUESTIONS=bench/portfolio_questions.txt \
+BENCH_DIR=/tmp/codekb-bench-portfolio-http \
+TRIALS=3 \
+STEER=1 \
+python3 bench/ollama_run.py
+
+python3 bench/ollama_compare.py /tmp/codekb-bench-portfolio-http \
+  portfolio-http > /tmp/codekb-bench-portfolio-http/SUMMARY.md
+```
+
+The release target for monorepos / portfolio-scale KBs is at least **35%
+model-token savings** versus the no-MCP Read/Grep/Bash baseline while
+preserving or improving evidence quality. If the measured savings are below
+35%, do not market a blanket savings claim; report the per-question wins,
+losses, and quality findings instead.
 
 ### Phase 2 (LLM-distilled symbol summaries)
 
