@@ -86,6 +86,8 @@ impl Profile {
 const WRAPPER_TOOLS: &[&str] = &[
     "helios_ask",
     "helios_repo_summary",
+    "helios_file_lookup",
+    "helios_doc_lookup",
     "helios_outline_first",
     "helios_doc_drill",
     #[cfg(feature = "wrappers-semantic")]
@@ -99,6 +101,8 @@ const WRAPPER_TOOLS: &[&str] = &[
 const MINIMAL_ALLOW: &[&str] = &[
     "helios_ask",
     "helios_repo_summary",
+    "helios_file_lookup",
+    "helios_doc_lookup",
     "helios_outline_first",
     "helios_doc_drill",
     #[cfg(feature = "wrappers-semantic")]
@@ -115,6 +119,8 @@ const STANDARD_ALLOW: &[&str] = &[
     // wrappers
     "helios_ask",
     "helios_repo_summary",
+    "helios_file_lookup",
+    "helios_doc_lookup",
     "helios_outline_first",
     "helios_doc_drill",
     #[cfg(feature = "wrappers-semantic")]
@@ -391,6 +397,8 @@ mod tests {
         let minimal_keeps: &[&str] = &[
             "helios_ask",
             "helios_repo_summary",
+            "helios_file_lookup",
+            "helios_doc_lookup",
             "helios_outline_first",
             "helios_doc_drill",
             #[cfg(feature = "wrappers-semantic")]

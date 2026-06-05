@@ -24,6 +24,9 @@ Environment / CLI:
     WITH_DIR        source root visible to WITH-MCP runs
     WITHOUT_DIR     source root visible to WITHOUT-MCP runs
     MCP_BIN         path to heliosdb-codekb-mcp binary
+    MCP_URL         optional warm HTTP MCP endpoint, e.g. http://127.0.0.1:8765/
+                    When set, WITH-MCP runs use this daemon instead of
+                    spawning a stdio subprocess per question.
     MCP_PROFILE     --profile passed to the MCP server (default standard)
     MCP_STRIP       --strip-tool-descriptions (default 200)
     TRIALS          per-question trials (default 1)
@@ -77,6 +80,7 @@ QUESTIONS = Path(os.environ.get("QUESTIONS", str(Path(__file__).parent / "questi
 WITH_DIR = os.environ.get("WITH_DIR")
 WITHOUT_DIR = os.environ.get("WITHOUT_DIR")
 MCP_BIN = os.environ.get("MCP_BIN") or _find_mcp_binary()
+MCP_URL = os.environ.get("MCP_URL", "").rstrip("/")
 MCP_PROFILE = os.environ.get("MCP_PROFILE", "standard")
 MCP_STRIP = os.environ.get("MCP_STRIP", "200")
 MCP_MEGA = os.environ.get("MCP_MEGA", "1") == "1"
@@ -174,6 +178,42 @@ class McpStdioClient:
             self.proc.kill()
 
 
+class McpHttpClient:
+    """Tiny JSON-RPC HTTP client for a warm `serve --http` daemon."""
+
+    def __init__(self, base_url: str):
+        self.base_url = base_url.rstrip("/") + "/"
+        self._id = 0
+
+    def _rpc(self, method: str, params: dict | None = None) -> dict:
+        self._id += 1
+        body = {
+            "jsonrpc": "2.0",
+            "id": self._id,
+            "method": method,
+            "params": params or {},
+        }
+        data = json.dumps(body).encode()
+        req = urllib.request.Request(
+            self.base_url,
+            data=data,
+            headers={"Content-Type": "application/json"},
+        )
+        with urllib.request.urlopen(req, timeout=300) as resp:
+            return json.loads(resp.read().decode())
+
+    def list_tools(self) -> list[dict]:
+        resp = self._rpc("tools/list", {})
+        return resp.get("result", {}).get("tools", [])
+
+    def call_tool(self, name: str, arguments: dict) -> dict:
+        resp = self._rpc("tools/call", {"name": name, "arguments": arguments})
+        return resp.get("result") or {"isError": True, "error": resp.get("error")}
+
+    def close(self):
+        return None
+
+
 def mcp_tools_to_openai(mcp_tools: list[dict]) -> list[dict]:
     """Translate MCP tool descriptors → OpenAI-format tool function defs."""
     out = []
@@ -225,9 +265,27 @@ def local_glob(args: dict, root: str) -> str:
     pattern = args.get("pattern") or ""
     if not pattern:
         return "error: missing `pattern`"
-    base = Path(root)
-    matches = [str(p.relative_to(base)) for p in base.rglob(pattern) if p.is_file()][:200]
-    return "\n".join(matches) if matches else "(no matches)"
+    try:
+        r = subprocess.run(
+            ["rg", "--files", "-g", pattern],
+            capture_output=True,
+            text=True,
+            cwd=root,
+            timeout=60,
+        )
+        if r.returncode not in (0, 1):
+            return f"error: {r.stderr.strip() or 'rg failed'}"
+        lines = [line for line in r.stdout.splitlines() if line][:200]
+        if not lines:
+            return "(no matches)"
+        suffix = "\n(truncated at 200 hits)" if len(r.stdout.splitlines()) > 200 else ""
+        return "\n".join(lines) + suffix
+    except FileNotFoundError:
+        base = Path(root)
+        matches = [str(p.relative_to(base)) for p in base.rglob(pattern) if p.is_file()][:200]
+        return "\n".join(matches) if matches else "(no matches)"
+    except subprocess.TimeoutExpired:
+        return "error: glob timed out"
 
 
 def local_grep(args: dict, root: str) -> str:
@@ -235,25 +293,42 @@ def local_grep(args: dict, root: str) -> str:
     path_glob = args.get("path") or "**/*"
     if not pattern:
         return "error: missing `pattern`"
+    rg_glob = None if path_glob == "**/*" else (path_glob if "*" in path_glob else f"**/{path_glob}")
     try:
-        rx = re.compile(pattern)
-    except re.error as e:
-        return f"error: invalid regex: {e}"
-    base = Path(root)
-    hits = []
-    for p in base.rglob(path_glob if "*" in path_glob else f"**/{path_glob}"):
-        if not p.is_file():
-            continue
+        cmd = ["rg", "--line-number", "--no-heading", "--color", "never", pattern]
+        if rg_glob:
+            cmd.extend(["-g", rg_glob])
+        r = subprocess.run(cmd, capture_output=True, text=True, cwd=root, timeout=60)
+        if r.returncode == 1:
+            return "(no matches)"
+        if r.returncode != 0:
+            return f"error: {r.stderr.strip() or 'rg failed'}"
+        lines = r.stdout.splitlines()
+        hits = lines[:200]
+        suffix = "\n(truncated at 200 hits)" if len(lines) > 200 else ""
+        return "\n".join(hits) + suffix if hits else "(no matches)"
+    except FileNotFoundError:
         try:
-            with open(p, "r", encoding="utf-8", errors="replace") as f:
-                for i, line in enumerate(f, 1):
-                    if rx.search(line):
-                        hits.append(f"{p.relative_to(base)}:{i}:{line.rstrip()}")
-                        if len(hits) >= 200:
-                            return "\n".join(hits) + "\n(truncated at 200 hits)"
-        except Exception:
-            continue
-    return "\n".join(hits) if hits else "(no matches)"
+            rx = re.compile(pattern)
+        except re.error as e:
+            return f"error: invalid regex: {e}"
+        base = Path(root)
+        hits = []
+        for p in base.rglob(path_glob if "*" in path_glob else f"**/{path_glob}"):
+            if not p.is_file():
+                continue
+            try:
+                with open(p, "r", encoding="utf-8", errors="replace") as f:
+                    for i, line in enumerate(f, 1):
+                        if rx.search(line):
+                            hits.append(f"{p.relative_to(base)}:{i}:{line.rstrip()}")
+                            if len(hits) >= 200:
+                                return "\n".join(hits) + "\n(truncated at 200 hits)"
+            except Exception:
+                continue
+        return "\n".join(hits) if hits else "(no matches)"
+    except subprocess.TimeoutExpired:
+        return "error: grep timed out"
 
 
 def local_bash(args: dict, root: str) -> str:
@@ -505,7 +580,7 @@ def load_questions(path: Path) -> list[str]:
 def run_with_mcp(question: str) -> dict:
     if not WITH_DIR:
         raise SystemExit("WITH_DIR env var required for WITH-MCP run")
-    client = McpStdioClient(WITH_DIR, MCP_PROFILE, MCP_STRIP)
+    client = McpHttpClient(MCP_URL) if MCP_URL else McpStdioClient(WITH_DIR, MCP_PROFILE, MCP_STRIP)
     try:
         mcp_tools = client.list_tools()
         tools = mcp_tools_to_openai(mcp_tools)
@@ -563,8 +638,11 @@ def envelope(question: str, run: dict, setup: str, wall_secs: float) -> dict:
 
 
 def main() -> int:
-    if not MCP_BIN:
-        print("ERROR: heliosdb-codekb-mcp binary not found. Set MCP_BIN=<path>.", file=sys.stderr)
+    if not MCP_BIN and not MCP_URL:
+        print(
+            "ERROR: heliosdb-codekb-mcp binary not found. Set MCP_BIN=<path> or MCP_URL=<http endpoint>.",
+            file=sys.stderr,
+        )
         return 2
     if not WITH_DIR or not WITHOUT_DIR:
         print("ERROR: WITH_DIR and WITHOUT_DIR env vars required.", file=sys.stderr)
@@ -587,6 +665,7 @@ def main() -> int:
     print(f"trials:   {TRIALS}")
     print(f"questions: {len(questions)}")
     print(f"results:  {BENCH_DIR}")
+    print(f"mcp:      {MCP_URL or MCP_BIN}")
     print()
 
     for i, q in enumerate(questions, 1):

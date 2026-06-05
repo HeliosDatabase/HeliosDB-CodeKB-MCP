@@ -1,7 +1,19 @@
 # Agent install templates
 
-These templates register a HeliosDB portfolio KB rooted at
-`/home/app/Helios`.
+These templates register the Helios portfolio KB rooted at
+`/home/app/Helios` through the local HTTP MCP daemon at
+`http://127.0.0.1:8765/`.
+
+## Binary install
+
+```bash
+install/install.sh
+```
+
+By default this installs the latest crates.io release. Set
+`HELIOS_CODEKB_VERSION=v0.2.3` or another published tag to pin a GitHub
+release asset when one exists; unsupported platforms install the matching
+crates.io version.
 
 ## Claude Code
 
@@ -13,9 +25,15 @@ block into an existing project MCP config.
 
 Merge `install/codex.config.toml` into `~/.codex/config.toml`.
 
-Both templates use compact `helios(action, args)` mode and a wrapper
-cache of 128 entries to reduce MCP tool-list tokens and repeated
-wrapper calls.
+Start the daemon first:
+
+```bash
+heliosdb-codekb-mcp serve --source /home/app/Helios \
+  --http 127.0.0.1:8765 --wrapper-cache-size 128
+```
+
+The daemon defaults to compact `helios(action, args)` mode and keeps the
+wrapper cache warm across Claude Code and Codex sessions.
 
 For this portfolio-scale checkout, the first completed KB was generated
 with `ingest --skip-code-graph --skip-linker`; full code-symbol and

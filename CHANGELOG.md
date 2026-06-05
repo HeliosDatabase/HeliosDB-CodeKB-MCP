@@ -4,6 +4,47 @@ Format roughly follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/);
 versions track [Semantic Versioning](https://semver.org/spec/v2.0.0.html) on the
 plugin's CLI + MCP-tool contract, NOT on the embedded engine version.
 
+## [0.2.5] — 2026-06-05
+
+Patch release to publish the HTTP-first adoption docs and installer
+cleanup after `0.2.4`.
+
+### Changed
+
+- README now leads with the practical CodeKB MCP benefits, the observed
+  portfolio benchmark range, and honest caveats for narrow lookups.
+- `install/install.sh` installs the latest crates.io release by default
+  and uses `HELIOS_CODEKB_VERSION` only for explicit pinned installs.
+- Release/adoption benchmark assets are included for warm HTTP MCP
+  portfolio testing.
+
+## [0.2.4] — 2026-06-03
+
+Adoption-focused release candidate for Claude Code and Codex users.
+
+### Added
+
+- `doctor --source <PATH> --mcp-url <URL>` to diagnose config, KB path,
+  RocksDB/Nano lock holders, background quality phase, and live HTTP
+  reachability/cache state.
+- `config set-serve` to persist `[serve]` defaults without hand-editing
+  TOML.
+- `helios_file_lookup` / `helios_doc_lookup` wrappers plus mega-tool
+  actions `file_lookup` / `doc_lookup` for exact path and doc questions.
+  These hit the compact ingest tables before falling back to broader
+  GraphRAG, reducing the direct-file regression seen in earlier benches.
+- Loopback-bind safety for HTTP mode. Non-loopback binds require the
+  explicit `HELIOS_ALLOW_NON_LOOPBACK_HTTP=1` override.
+
+### Changed
+
+- Lockfile refreshed to published `heliosdb-nano 3.36.1`.
+- Install docs, plugin metadata, slash-command setup, and portfolio
+  templates now prefer a shared loopback HTTP daemon over per-session
+  stdio.
+- `helios_ask` now routes likely file/doc path questions to exact lookup
+  wrappers before symbol-card or graph search.
+
 ## [0.2.3] — 2026-05-29
 
 Release-readiness and portfolio-scale install patch.

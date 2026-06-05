@@ -1,0 +1,13 @@
+# Broad monorepo questions for the /home/app/Helios portfolio KB.
+# Keep these focused on cross-repo architecture and docs/code linkage,
+# not tiny exact-span lookups where raw Read/Grep should win.
+Which repositories under this Helios portfolio contain the database engine, API/server products, docs, website, SDKs, and infrastructure providers?
+Where is HeliosDB-Nano's MCP endpoint implemented, and which wrapper in heliosdb-codekb-mcp exposes it to agents?
+Explain how code graph ingestion, GraphRAG document projection, and text-to-code MENTIONS work together across the portfolio.
+Which files describe or implement JDBC support in Nano, and what do they say about how clients connect?
+Where does the Full product document or implement hybrid search, vector search, or HNSW indexing?
+What changed recently in heliosdb-codekb-mcp to make Claude Code and Codex use a shared loopback HTTP MCP server?
+Find README or setup documentation for the Helios website, SDKs, and infrastructure provider repos.
+Identify the highest-value files an agent should inspect first to understand the Helios portfolio architecture.
+Where are Kubernetes, Terraform, and Pulumi integration repos represented in the portfolio, and what is each for?
+Show the exact docs or source entries that mention MCP, GraphRAG, and code indexing together.

@@ -177,6 +177,8 @@ fn all_plugin_wrappers_appear_in_tools_list() {
     let expected = vec![
         "helios_ask",
         "helios_repo_summary",
+        "helios_file_lookup",
+        "helios_doc_lookup",
         "helios_outline_first",
         "helios_doc_drill",
         "helios_git_summary",
@@ -259,6 +261,44 @@ fn helios_outline_first_returns_sections_array() {
     let _ = sections.len();
     assert_eq!(inner["schema"], "helios.answer_card.v1");
     assert!(inner["answer_card"].is_object());
+}
+
+#[test]
+fn helios_file_lookup_returns_exact_path_match() {
+    let f = Fixture::spawn();
+    let resp = f.call(
+        "helios_file_lookup",
+        serde_json::json!({"path": "a.rs", "include_content": true, "budget_tokens": 400}),
+    );
+    let content_text = resp["result"]["content"][0]["text"]
+        .as_str()
+        .expect("text content");
+    let inner: serde_json::Value = serde_json::from_str(content_text).expect("inner JSON parses");
+    assert_eq!(inner["schema"], "helios.answer_card.v1");
+    assert_eq!(inner["answer_card"]["kind"], "file_lookup");
+    assert_eq!(inner["count"], 1);
+    assert_eq!(inner["matches"][0]["path"], "a.rs");
+    assert!(inner["matches"][0]["content"]
+        .as_str()
+        .unwrap()
+        .contains("add"));
+}
+
+#[test]
+fn helios_doc_lookup_returns_exact_markdown_match() {
+    let f = Fixture::spawn();
+    let resp = f.call(
+        "helios_doc_lookup",
+        serde_json::json!({"path": "README.md", "include_content": false}),
+    );
+    let content_text = resp["result"]["content"][0]["text"]
+        .as_str()
+        .expect("text content");
+    let inner: serde_json::Value = serde_json::from_str(content_text).expect("inner JSON parses");
+    assert_eq!(inner["schema"], "helios.answer_card.v1");
+    assert_eq!(inner["answer_card"]["kind"], "doc_lookup");
+    assert_eq!(inner["count"], 1);
+    assert_eq!(inner["matches"][0]["path"], "README.md");
 }
 
 #[test]

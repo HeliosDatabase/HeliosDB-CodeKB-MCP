@@ -250,20 +250,42 @@ pub const MEGA_TOOL_NAME: &str = "helios";
 /// the plugin and engine expose.
 pub fn mega_tool_descriptor() -> JsonValue {
     let plugin_actions = plugin_action_names().join(", ");
+    let action_enum = vec![
+        "ask",
+        "repo_summary",
+        "file_lookup",
+        "doc_lookup",
+        "outline_first",
+        "doc_drill",
+        "git_summary",
+        "symbol_card",
+        "query",
+        "hybrid_search",
+        "graphrag_search",
+        "lsp_definition",
+        "lsp_references",
+        "lsp_call_hierarchy",
+        "lsp_hover",
+        "lsp_document_symbols",
+        "ast_diff",
+        "list_actions",
+    ];
     json!({
         "name": MEGA_TOOL_NAME,
         "description": format!("One-tool gateway to the heliosdb-codekb MCP. \
-            Call with {{action: \"<name>\", args: {{...}}}}. Available plugin actions: \
-            {plugin_actions}; plus passthrough to any engine tool by \
-            short name (e.g. action=\"lsp_definition\", \"graphrag_search\", \
-            \"query\", \"ast_diff\"). Use action=\"list_actions\" to fetch the \
-            full per-action arg schema catalogue on demand."),
+            Call with {{action: \"<name>\", args: {{...}}}}. Prefer file_lookup \
+            for exact paths, doc_lookup for README/docs, ask for broad repo \
+            questions, and repo_summary for portfolio/module maps. Available \
+            plugin actions: {plugin_actions}; plus engine passthrough names like \
+            lsp_definition, graphrag_search, query, ast_diff. Use list_actions \
+            only when the needed schema is unknown."),
         "inputSchema": {
             "type": "object",
             "required": ["action"],
             "properties": {
                 "action": {
                     "type": "string",
+                    "enum": action_enum,
                     "description": "Sub-action name. See list_actions for schemas."
                 },
                 "args": {
@@ -302,6 +324,8 @@ pub fn resolve_action_name(action: &str) -> Option<&'static str> {
         // Plugin wrappers (drop the `helios_` prefix).
         "ask" => Some("helios_ask"),
         "repo_summary" => Some("helios_repo_summary"),
+        "file_lookup" => Some("helios_file_lookup"),
+        "doc_lookup" => Some("helios_doc_lookup"),
         "outline_first" => Some("helios_outline_first"),
         "doc_drill" => Some("helios_doc_drill"),
         #[cfg(feature = "wrappers-semantic")]
@@ -445,6 +469,18 @@ pub const PLUGIN_TOOLS: &[ToolDesc] = &[
         handler: repo_summary_handler,
     },
     ToolDesc {
+        name: "helios_file_lookup",
+        description: "Exact path/name lookup across ingested code and docs.",
+        input_schema: file_lookup_schema,
+        handler: file_lookup_handler,
+    },
+    ToolDesc {
+        name: "helios_doc_lookup",
+        description: "Exact doc path lookup or compact doc-section search.",
+        input_schema: doc_lookup_schema,
+        handler: doc_lookup_handler,
+    },
+    ToolDesc {
         name: "helios_outline_first",
         description: "Doc headings + 1-line summaries (no chunk bodies).",
         input_schema: outline_first_schema,
@@ -529,6 +565,10 @@ fn repo_summary_schema() -> JsonValue {
                 "items": { "type": "string" },
                 "description": "Optional projection on per-file cards. Choices: path, pagerank, top_symbols. Omit for all."
             },
+            "query": {
+                "type": "string",
+                "description": "Optional keyword filter for portfolio inventory, e.g. Kubernetes Terraform Pulumi."
+            },
             "budget_tokens": {
                 "type": "integer",
                 "default": 1200,
@@ -536,6 +576,48 @@ fn repo_summary_schema() -> JsonValue {
                 "maximum": 8000,
                 "description": "Approximate response budget for the answer_card/evidence."
             }
+        }
+    })
+}
+
+fn file_lookup_schema() -> JsonValue {
+    json!({
+        "type": "object",
+        "properties": {
+            "path": {
+                "type": "string",
+                "description": "Exact repo-relative path. If no exact match exists, falls back to path contains search."
+            },
+            "query": {
+                "type": "string",
+                "description": "Filename/path query when exact path is unknown."
+            },
+            "include_content": {
+                "type": "boolean",
+                "default": false,
+                "description": "Include compact content snippets. Off by default to avoid broad Read-style payloads."
+            },
+            "max_matches": { "type": "integer", "default": 10, "minimum": 1, "maximum": 50 },
+            "budget_tokens": { "type": "integer", "default": 1200, "minimum": 200, "maximum": 8000 }
+        }
+    })
+}
+
+fn doc_lookup_schema() -> JsonValue {
+    json!({
+        "type": "object",
+        "properties": {
+            "path": {
+                "type": "string",
+                "description": "Exact repo-relative documentation path, such as README.md or docs/foo.md."
+            },
+            "query": {
+                "type": "string",
+                "description": "Documentation search query. Uses exact doc tables first, then compact DocSection search."
+            },
+            "include_content": { "type": "boolean", "default": false },
+            "max_matches": { "type": "integer", "default": 10, "minimum": 1, "maximum": 50 },
+            "budget_tokens": { "type": "integer", "default": 1200, "minimum": 200, "maximum": 8000 }
         }
     })
 }
@@ -634,6 +716,10 @@ fn arg_str_opt<'a>(args: &'a JsonValue, key: &str) -> Option<&'a str> {
 
 fn arg_int(args: &JsonValue, key: &str, default: i64) -> i64 {
     args.get(key).and_then(|v| v.as_i64()).unwrap_or(default)
+}
+
+fn arg_bool(args: &JsonValue, key: &str, default: bool) -> bool {
+    args.get(key).and_then(|v| v.as_bool()).unwrap_or(default)
 }
 
 fn arg_int_required(args: &JsonValue, key: &str) -> Result<i64, String> {
@@ -752,6 +838,55 @@ fn likely_symbol_term(question: &str) -> Option<String> {
         .map(str::to_string)
 }
 
+fn likely_path_term(question: &str) -> Option<String> {
+    for part in question.split('`').skip(1).step_by(2) {
+        let term = part.trim();
+        if looks_like_path_token(term) {
+            return Some(term.to_string());
+        }
+    }
+    question
+        .split(|c: char| c.is_whitespace() || matches!(c, ',' | ':' | ';' | '(' | ')' | '[' | ']'))
+        .map(|s| s.trim_matches(|c: char| matches!(c, '"' | '\'' | '`' | '.')))
+        .find(|s| looks_like_path_token(s))
+        .map(str::to_string)
+}
+
+fn looks_like_path_token(s: &str) -> bool {
+    if s.is_empty() {
+        return false;
+    }
+    let lower = s.to_ascii_lowercase();
+    s.contains('/')
+        || [
+            ".rs", ".py", ".ts", ".tsx", ".js", ".jsx", ".go", ".java", ".kt", ".cs", ".cpp", ".c",
+            ".h", ".hpp", ".md", ".mdx", ".toml", ".yaml", ".yml", ".json", ".sql", ".proto",
+            ".graphql",
+        ]
+        .iter()
+        .any(|ext| lower.ends_with(ext))
+        || matches!(
+            lower.as_str(),
+            "readme" | "readme.md" | "changelog" | "changelog.md"
+        )
+}
+
+fn looks_like_direct_file_question(q: &str) -> bool {
+    let q = q.to_ascii_lowercase();
+    [
+        "file",
+        "read ",
+        "show ",
+        "open ",
+        "where is",
+        "where are",
+        "list ",
+        "public types",
+    ]
+    .iter()
+    .any(|needle| q.contains(needle))
+}
+
 fn looks_like_architecture_question(q: &str) -> bool {
     let q = q.to_ascii_lowercase();
     [
@@ -759,6 +894,15 @@ fn looks_like_architecture_question(q: &str) -> bool {
         "overview",
         "layout",
         "modules",
+        "portfolio",
+        "repositories",
+        "repos",
+        "repo ",
+        "integration",
+        "kubernetes",
+        "terraform",
+        "pulumi",
+        "highest-value",
         "structure",
         "where does this codebase",
     ]
@@ -834,10 +978,33 @@ fn ask_handler(db: &EmbeddedDatabase, args: &JsonValue) -> Result<JsonValue, Str
     let mode = arg_str_opt(args, "mode").unwrap_or("answer");
     let budget = arg_budget_tokens(args, 1500);
 
-    let (route, routed_args, result) = if looks_like_architecture_question(question) {
+    let (route, routed_args, result) = if let Some(path) = likely_path_term(question) {
+        let include_content = mode == "edit" || looks_like_direct_file_question(question);
+        let is_doc_path = path.to_ascii_lowercase().ends_with(".md")
+            || path.eq_ignore_ascii_case("readme")
+            || path.eq_ignore_ascii_case("readme.md");
         let routed_args = json!({
-            "detail": "file_index",
+            "path": path.clone(),
+            "include_content": include_content,
+            "max_matches": 5,
+            "budget_tokens": budget,
+        });
+        let result = if is_doc_path {
+            doc_lookup_handler(db, &routed_args)?
+        } else {
+            file_lookup_handler(db, &routed_args)?
+        };
+        let route = if is_doc_path {
+            "doc_lookup"
+        } else {
+            "file_lookup"
+        };
+        (route, routed_args, result)
+    } else if looks_like_architecture_question(question) {
+        let routed_args = json!({
+            "detail": "minimal",
             "limit": 20,
+            "fields": ["repo", "total_files", "readmes", "sample_paths"],
             "budget_tokens": budget,
         });
         let result = repo_summary_handler(db, &routed_args)?;
@@ -912,22 +1079,11 @@ fn repo_summary_handler(db: &EmbeddedDatabase, args: &JsonValue) -> Result<JsonV
     let detail = arg_str_opt(args, "detail").unwrap_or("file_index");
     let limit = arg_int(args, "limit", 50).clamp(1, 500);
     let fields = arg_field_set(args);
+    let query = arg_str_opt(args, "query");
 
-    if !table_exists(db, "_hdb_plugin_repomap_cards") {
-        let payload = json!({
-            "status": "cards_not_built",
-            "message": "_hdb_plugin_repomap_cards not present. Re-run `heliosdb-codekb-mcp ingest --source <root>` after Layer 3 (distill) lands to populate the table.",
-            "files": []
-        });
-        return Ok(attach_answer_card(
-            payload,
-            "repo_summary",
-            "RepoMap cards are not built yet; run ingest to populate compact file summaries.",
-            Vec::new(),
-            args,
-            1200,
-            Vec::new(),
-        ));
+    let cards_available = table_exists(db, "_hdb_plugin_repomap_cards");
+    if !cards_available || query.is_some() {
+        return repo_summary_path_inventory(db, args, limit, fields.as_ref(), query);
     }
 
     let sql = format!(
@@ -937,6 +1093,9 @@ fn repo_summary_handler(db: &EmbeddedDatabase, args: &JsonValue) -> Result<JsonV
     let rows = db
         .query(&sql, &[])
         .map_err(|e| format!("query failed: {e}"))?;
+    if rows.is_empty() {
+        return repo_summary_path_inventory(db, args, limit, fields.as_ref(), query);
+    }
 
     let mut files = Vec::with_capacity(rows.len());
     for row in &rows {
@@ -1005,6 +1164,634 @@ fn repo_summary_handler(db: &EmbeddedDatabase, args: &JsonValue) -> Result<JsonV
         args,
         1200,
         Vec::new(),
+    ))
+}
+
+#[derive(Debug, Default)]
+struct RepoInventory {
+    repo: String,
+    code_files: i64,
+    text_docs: i64,
+    markdown_docs: i64,
+    sample_paths: Vec<String>,
+    readmes: Vec<String>,
+    matched_paths: Vec<String>,
+}
+
+fn repo_summary_path_inventory(
+    db: &EmbeddedDatabase,
+    args: &JsonValue,
+    limit: i64,
+    fields: Option<&std::collections::HashSet<String>>,
+    query: Option<&str>,
+) -> Result<JsonValue, String> {
+    let query_terms = query.map(lookup_terms).unwrap_or_default();
+    let mut by_repo = std::collections::BTreeMap::<String, RepoInventory>::new();
+    collect_repo_inventory(db, "src", "code_files", &query_terms, &mut by_repo)?;
+    collect_repo_inventory(db, "docs", "text_docs", &query_terms, &mut by_repo)?;
+    collect_repo_inventory(db, "docs_md", "markdown_docs", &query_terms, &mut by_repo)?;
+
+    let mut repos = by_repo.into_values().collect::<Vec<_>>();
+    if !query_terms.is_empty() {
+        repos.retain(|r| repo_matches_query(r, &query_terms));
+    }
+    repos.sort_by(|a, b| {
+        let a_total = a.code_files + a.text_docs + a.markdown_docs;
+        let b_total = b.code_files + b.text_docs + b.markdown_docs;
+        let a_rank = repo_query_rank(a, &query_terms);
+        let b_rank = repo_query_rank(b, &query_terms);
+        a_rank
+            .cmp(&b_rank)
+            .then_with(|| b_total.cmp(&a_total))
+            .then_with(|| {
+                a.repo
+                    .to_ascii_lowercase()
+                    .cmp(&b.repo.to_ascii_lowercase())
+            })
+    });
+    let total_count = repos.len();
+    repos.truncate(limit as usize);
+
+    let mut remaining = budget_bytes(args, 1200);
+    let mut omitted = Vec::new();
+    let mut files = Vec::new();
+    for r in repos {
+        let total_files = r.code_files + r.text_docs + r.markdown_docs;
+        let item = json!({
+        "repo": r.repo,
+        "total_files": total_files,
+        "code_files": r.code_files,
+        "text_docs": r.text_docs,
+            "markdown_docs": r.markdown_docs,
+            "readmes": r.readmes,
+            "sample_paths": r.sample_paths,
+            "matched_paths": r.matched_paths,
+        });
+        let item = project(item, fields);
+        let approx_bytes = serde_json::to_string(&item).map(|s| s.len()).unwrap_or(256);
+        if !files.is_empty() && approx_bytes > remaining {
+            omitted.push(json!({
+                "reason": "budget",
+                "repo": item.get("repo").cloned().unwrap_or(JsonValue::Null),
+                "bytes": approx_bytes,
+            }));
+            break;
+        }
+        remaining = remaining.saturating_sub(approx_bytes);
+        files.push(item);
+    }
+
+    let evidence = files
+        .iter()
+        .take(10)
+        .filter_map(|f| {
+            Some(json!({
+                "repo": f.get("repo")?.clone(),
+                "total_files": f.get("total_files").cloned().unwrap_or(JsonValue::Null),
+                "readmes": f.get("readmes").cloned().unwrap_or(JsonValue::Array(vec![])),
+            }))
+        })
+        .collect::<Vec<_>>();
+
+    let count = files.len();
+    let payload = json!({
+        "status": "path_inventory",
+        "detail": "repo_inventory",
+        "query": query,
+        "count": count,
+        "total_repositories": total_count,
+        "files": files,
+        "note": "Code-graph distill cards are not present; this summary is derived from ingested source/doc paths."
+    });
+    Ok(attach_answer_card(
+        payload,
+        "repo_summary",
+        format!(
+            "Returned {count} top-level repository inventory rows from ingested source/doc paths."
+        ),
+        evidence,
+        args,
+        1200,
+        omitted,
+    ))
+}
+
+fn collect_repo_inventory(
+    db: &EmbeddedDatabase,
+    table: &str,
+    counter: &str,
+    query_terms: &[String],
+    by_repo: &mut std::collections::BTreeMap<String, RepoInventory>,
+) -> Result<(), String> {
+    if !table_exists(db, table) {
+        return Ok(());
+    }
+    let sql = format!("SELECT path FROM {table} ORDER BY path");
+    let rows = db
+        .query(&sql, &[])
+        .map_err(|e| format!("{table} inventory query failed: {e}"))?;
+    for row in rows {
+        let path = tuple_str(&row, 0);
+        let Some((repo, _rest)) = path.split_once('/') else {
+            continue;
+        };
+        let repo = repo.trim();
+        if repo.is_empty() {
+            continue;
+        }
+        let entry = by_repo
+            .entry(repo.to_string())
+            .or_insert_with(|| RepoInventory {
+                repo: repo.to_string(),
+                ..RepoInventory::default()
+            });
+        match counter {
+            "code_files" => entry.code_files += 1,
+            "text_docs" => entry.text_docs += 1,
+            "markdown_docs" => entry.markdown_docs += 1,
+            _ => {}
+        }
+        if entry.sample_paths.len() < 6 {
+            entry.sample_paths.push(path.clone());
+        }
+        if path_matches_any_query(&path, repo, query_terms) && entry.matched_paths.len() < 8 {
+            entry.matched_paths.push(path.clone());
+        }
+        let leaf = path.rsplit('/').next().unwrap_or("").to_ascii_lowercase();
+        if leaf == "readme.md" && entry.readmes.len() < 4 && !entry.readmes.contains(&path) {
+            entry.readmes.push(path);
+        }
+    }
+    Ok(())
+}
+
+fn repo_matches_query(repo: &RepoInventory, query_terms: &[String]) -> bool {
+    repo_name_matches_any_query(&repo.repo, query_terms)
+        || !repo.matched_paths.is_empty()
+        || repo
+            .readmes
+            .iter()
+            .any(|path| path_matches_any_query(path, &repo.repo, query_terms))
+}
+
+fn repo_query_rank(repo: &RepoInventory, query_terms: &[String]) -> u8 {
+    if query_terms.is_empty() {
+        return 0;
+    }
+    if repo_name_matches_any_query(&repo.repo, query_terms) {
+        return 0;
+    }
+    if !repo.matched_paths.is_empty() {
+        return 1;
+    }
+    2
+}
+
+fn repo_name_matches_any_query(repo: &str, query_terms: &[String]) -> bool {
+    let repo_l = repo.to_ascii_lowercase();
+    query_terms.iter().any(|term| {
+        let term_l = term.to_ascii_lowercase();
+        repo_l.contains(&term_l) || (term_l == "kubernetes" && repo_l.contains("operator"))
+    })
+}
+
+fn path_matches_any_query(path: &str, repo: &str, query_terms: &[String]) -> bool {
+    let path_l = path.to_ascii_lowercase();
+    repo_name_matches_any_query(repo, query_terms)
+        || query_terms
+            .iter()
+            .any(|term| path_l.contains(&term.to_ascii_lowercase()))
+}
+
+#[derive(Debug, Clone)]
+struct LookupMatch {
+    path: String,
+    source: &'static str,
+    kind: String,
+    content: String,
+}
+
+struct LookupRequest<'a> {
+    table: &'static str,
+    kind_col: &'static str,
+    path: Option<&'a str>,
+    query: Option<&'a str>,
+    max_matches: i64,
+    search_content: bool,
+}
+
+fn lookup_ingested_rows(
+    db: &EmbeddedDatabase,
+    req: LookupRequest<'_>,
+    out: &mut Vec<LookupMatch>,
+) -> Result<(), String> {
+    let LookupRequest {
+        table,
+        kind_col,
+        path,
+        query,
+        max_matches,
+        search_content,
+    } = req;
+    if !table_exists(db, table) {
+        return Ok(());
+    }
+    let sql;
+    let param;
+    if let Some(path) = path {
+        sql = format!("SELECT path, content, {kind_col} FROM {table} WHERE path = $1");
+        param = path.to_string();
+    } else if let Some(query) = query {
+        let mut params = Vec::new();
+        if search_content {
+            let terms = lookup_terms(query);
+            let effective_terms = if terms.is_empty() {
+                vec![query.to_string()]
+            } else {
+                terms
+            };
+            let mut clauses = Vec::with_capacity(effective_terms.len());
+            for (idx, term) in effective_terms.iter().enumerate() {
+                let param_idx = idx + 1;
+                clauses.push(format!(
+                    "(path LIKE ${param_idx} OR content LIKE ${param_idx})"
+                ));
+                params.push(heliosdb_nano::Value::String(format!("%{term}%")));
+            }
+            sql = format!(
+                "SELECT path, content, {kind_col} FROM {table} \
+                 WHERE {} ORDER BY path LIMIT {max_matches}",
+                clauses.join(" AND ")
+            );
+        } else {
+            sql = format!(
+                "SELECT path, content, {kind_col} FROM {table} \
+                 WHERE path LIKE $1 ORDER BY path LIMIT {max_matches}"
+            );
+            params.push(heliosdb_nano::Value::String(format!("%{query}%")));
+        }
+        let mut rows = db
+            .query_params(&sql, &params)
+            .map_err(|e| format!("{table} lookup failed: {e}"))?;
+        if rows.is_empty() && search_content && params.len() > 1 {
+            let terms = lookup_terms(query);
+            let effective_terms = if terms.is_empty() {
+                vec![query.to_string()]
+            } else {
+                terms
+            };
+            let mut clauses = Vec::with_capacity(effective_terms.len());
+            let mut or_params = Vec::with_capacity(effective_terms.len());
+            for (idx, term) in effective_terms.iter().enumerate() {
+                let param_idx = idx + 1;
+                clauses.push(format!(
+                    "(path LIKE ${param_idx} OR content LIKE ${param_idx})"
+                ));
+                or_params.push(heliosdb_nano::Value::String(format!("%{term}%")));
+            }
+            let or_sql = format!(
+                "SELECT path, content, {kind_col} FROM {table} \
+                 WHERE {} ORDER BY path LIMIT {max_matches}",
+                clauses.join(" OR ")
+            );
+            rows = db
+                .query_params(&or_sql, &or_params)
+                .map_err(|e| format!("{table} relaxed lookup failed: {e}"))?;
+        }
+        for row in rows {
+            if out.len() >= max_matches as usize {
+                break;
+            }
+            out.push(LookupMatch {
+                path: tuple_str(&row, 0),
+                source: table,
+                content: tuple_str(&row, 1),
+                kind: tuple_str(&row, 2),
+            });
+        }
+        return Ok(());
+    } else {
+        return Ok(());
+    }
+    let rows = db
+        .query_params(&sql, &[heliosdb_nano::Value::String(param)])
+        .map_err(|e| format!("{table} lookup failed: {e}"))?;
+    for row in rows {
+        if out.len() >= max_matches as usize {
+            break;
+        }
+        out.push(LookupMatch {
+            path: tuple_str(&row, 0),
+            source: table,
+            content: tuple_str(&row, 1),
+            kind: tuple_str(&row, 2),
+        });
+    }
+    Ok(())
+}
+
+fn lookup_terms(query: &str) -> Vec<String> {
+    const STOPWORDS: &[&str] = &[
+        "and",
+        "or",
+        "the",
+        "that",
+        "this",
+        "with",
+        "from",
+        "show",
+        "find",
+        "exact",
+        "docs",
+        "source",
+        "entries",
+        "entry",
+        "mention",
+        "mentions",
+        "together",
+        "where",
+        "what",
+        "which",
+        "how",
+        "are",
+        "is",
+        "for",
+        "each",
+        "repo",
+        "repos",
+        "repository",
+        "repositories",
+        "portfolio",
+        "represented",
+        "integration",
+        "integrations",
+        "implemented",
+        "exposes",
+        "agents",
+        "recently",
+        "changed",
+        "make",
+        "shared",
+        "loopback",
+        "server",
+    ];
+    let mut out = Vec::new();
+    for raw in query.split(|c: char| !c.is_ascii_alphanumeric() && c != '_' && c != '-') {
+        let term = raw.trim();
+        if term.len() < 3 {
+            continue;
+        }
+        let lower = term.to_ascii_lowercase();
+        if STOPWORDS.contains(&lower.as_str()) {
+            continue;
+        }
+        if !out.iter().any(|s| s == term) {
+            out.push(term.to_string());
+        }
+        if out.len() >= 4 {
+            break;
+        }
+    }
+    out
+}
+
+fn render_lookup_matches(
+    matches: Vec<LookupMatch>,
+    include_content: bool,
+    args: &JsonValue,
+    default_budget_tokens: usize,
+) -> (Vec<JsonValue>, Vec<JsonValue>, Vec<JsonValue>) {
+    let mut remaining = budget_bytes(args, default_budget_tokens);
+    let mut out = Vec::with_capacity(matches.len());
+    let mut evidence = Vec::new();
+    let mut omitted = Vec::new();
+    for m in matches {
+        let bytes = m.content.len();
+        let first_line = m
+            .content
+            .lines()
+            .find(|l| !l.trim().is_empty())
+            .unwrap_or("")
+            .chars()
+            .take(220)
+            .collect::<String>();
+        let mut item = json!({
+            "path": m.path,
+            "source": m.source,
+            "kind": m.kind,
+            "bytes": bytes,
+            "first_line": first_line,
+        });
+        if include_content {
+            let cap = remaining.min(m.content.len());
+            let (snippet, dropped) = shorten_chars(&m.content, cap);
+            remaining = remaining.saturating_sub(snippet.len());
+            if let Some(obj) = item.as_object_mut() {
+                obj.insert("content".to_string(), JsonValue::String(snippet));
+            }
+            if dropped > 0 {
+                omitted.push(json!({
+                    "reason": "budget",
+                    "path": item["path"].clone(),
+                    "bytes": dropped,
+                    "open_with": {
+                        "action": "file_lookup",
+                        "args": {
+                            "path": item["path"].clone(),
+                            "include_content": true,
+                            "budget_tokens": 8000
+                        }
+                    }
+                }));
+            }
+        }
+        evidence.push(json!({
+            "path": item["path"].clone(),
+            "source": item["source"].clone(),
+            "kind": item["kind"].clone(),
+            "bytes": item["bytes"].clone(),
+        }));
+        out.push(item);
+    }
+    (out, evidence, omitted)
+}
+
+fn file_lookup_handler(db: &EmbeddedDatabase, args: &JsonValue) -> Result<JsonValue, String> {
+    let path = arg_str_opt(args, "path");
+    let query = arg_str_opt(args, "query").or(path);
+    if path.is_none() && query.is_none() {
+        return Err("helios_file_lookup requires `path` or `query`".to_string());
+    }
+    let max_matches = arg_int(args, "max_matches", 10).clamp(1, 50);
+    let include_content = arg_bool(args, "include_content", false);
+    let mut matches = Vec::new();
+
+    for (table, kind_col) in [("src", "lang"), ("docs_md", "kind"), ("docs", "kind")] {
+        lookup_ingested_rows(
+            db,
+            LookupRequest {
+                table,
+                kind_col,
+                path,
+                query: None,
+                max_matches,
+                search_content: false,
+            },
+            &mut matches,
+        )?;
+    }
+
+    if matches.is_empty() {
+        for (table, kind_col) in [("src", "lang"), ("docs_md", "kind"), ("docs", "kind")] {
+            lookup_ingested_rows(
+                db,
+                LookupRequest {
+                    table,
+                    kind_col,
+                    path: None,
+                    query,
+                    max_matches,
+                    search_content: false,
+                },
+                &mut matches,
+            )?;
+        }
+    }
+
+    if matches.is_empty() {
+        for (table, kind_col) in [("src", "lang"), ("docs_md", "kind"), ("docs", "kind")] {
+            lookup_ingested_rows(
+                db,
+                LookupRequest {
+                    table,
+                    kind_col,
+                    path: None,
+                    query,
+                    max_matches,
+                    search_content: true,
+                },
+                &mut matches,
+            )?;
+        }
+    }
+
+    let (items, evidence, omitted) = render_lookup_matches(matches, include_content, args, 1200);
+    let count = items.len();
+    let summary = if count == 0 {
+        "No ingested file path matched; try a repo-relative path or run ingest.".to_string()
+    } else {
+        format!("Returned {count} exact/path file matches from the ingested KB.")
+    };
+    let payload = json!({
+        "path": path,
+        "query": query,
+        "count": count,
+        "matches": items,
+    });
+    Ok(attach_answer_card(
+        payload,
+        "file_lookup",
+        summary,
+        evidence,
+        args,
+        1200,
+        omitted,
+    ))
+}
+
+fn doc_lookup_handler(db: &EmbeddedDatabase, args: &JsonValue) -> Result<JsonValue, String> {
+    let path = arg_str_opt(args, "path");
+    let query = arg_str_opt(args, "query").or(path);
+    if path.is_none() && query.is_none() {
+        return Err("helios_doc_lookup requires `path` or `query`".to_string());
+    }
+    let max_matches = arg_int(args, "max_matches", 10).clamp(1, 50);
+    let include_content = arg_bool(args, "include_content", false);
+    let mut matches = Vec::new();
+
+    for (table, kind_col) in [("docs_md", "kind"), ("docs", "kind")] {
+        lookup_ingested_rows(
+            db,
+            LookupRequest {
+                table,
+                kind_col,
+                path,
+                query: None,
+                max_matches,
+                search_content: false,
+            },
+            &mut matches,
+        )?;
+    }
+    if matches.is_empty() {
+        for (table, kind_col) in [("docs_md", "kind"), ("docs", "kind")] {
+            lookup_ingested_rows(
+                db,
+                LookupRequest {
+                    table,
+                    kind_col,
+                    path: None,
+                    query,
+                    max_matches,
+                    search_content: true,
+                },
+                &mut matches,
+            )?;
+        }
+    }
+
+    if matches.is_empty() && path.is_none() {
+        let fallback_args = json!({
+            "query": query.unwrap_or_default(),
+            "max_sections": max_matches,
+            "budget_tokens": arg_budget_tokens(args, 1200),
+        });
+        let fallback = outline_first_handler(db, &fallback_args)?;
+        let evidence = fallback
+            .get("answer_card")
+            .and_then(|c| c.get("evidence"))
+            .and_then(|e| e.as_array())
+            .cloned()
+            .unwrap_or_default();
+        let payload = json!({
+            "path": path,
+            "query": query,
+            "count": 0,
+            "matches": [],
+            "fallback": fallback,
+        });
+        return Ok(attach_answer_card(
+            payload,
+            "doc_lookup",
+            "No exact doc row matched; returned compact DocSection search fallback.",
+            evidence,
+            args,
+            1200,
+            Vec::new(),
+        ));
+    }
+
+    let (items, evidence, omitted) = render_lookup_matches(matches, include_content, args, 1200);
+    let count = items.len();
+    let summary = if count == 0 {
+        "No ingested documentation matched; try a repo-relative path or run ingest.".to_string()
+    } else {
+        format!("Returned {count} documentation matches from the ingested KB.")
+    };
+    let payload = json!({
+        "path": path,
+        "query": query,
+        "count": count,
+        "matches": items,
+    });
+    Ok(attach_answer_card(
+        payload,
+        "doc_lookup",
+        summary,
+        evidence,
+        args,
+        1200,
+        omitted,
     ))
 }
 
